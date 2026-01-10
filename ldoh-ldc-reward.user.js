@@ -59,7 +59,7 @@
       position: absolute;
       right: 0;
       top: 20%;
-      z-index: 90;
+      z-index: 10;
 
       width: 40px;
       height: 36px;
@@ -873,8 +873,17 @@
   });
 
   window.addEventListener("load", () => {
-    scan();
-    observer.observe(document.body, { childList: true, subtree: true });
+    const start = () => {
+      scan();
+      observer.observe(document.body, { childList: true, subtree: true });
+    };
+
+    // 如果浏览器支持，在空闲时执行；否则延迟 800ms
+    if (window.requestIdleCallback) {
+      window.requestIdleCallback(start, { timeout: 2000 });
+    } else {
+      setTimeout(start, 800);
+    }
   });
 
   GM_registerMenuCommand("设置 LDC 凭证", () => UI.showConfig());
