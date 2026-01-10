@@ -12,6 +12,7 @@
 // @connect      credit.linux.do
 // @connect      linux.do
 // @run-at       document-idle
+// @license      MIT
 // ==/UserScript==
 
 (function () {
