@@ -1,0 +1,1453 @@
+// ==UserScript==
+// @name         LDOH New API Helper
+// @namespace    jojojotarou.ldoh.newapi.helper
+// @version      1.0.0
+// @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
+// @author       @JoJoJotarou
+// @match        https://ldoh.105117.xyz/*
+// @include      *
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
+// @connect      *
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // 只在顶级窗口运行，屏蔽 Iframe 里的“串味”日志和执行
+  if (window.top !== window.self) return;
+  if (window.__LDOH_HELPER_RUNNING__) return;
+  window.__LDOH_HELPER_RUNNING__ = true;
+
+  // ==================== 配置管理 ====================
+  const CONFIG = {
+    STORAGE_KEY: "ldoh_newapi_data",
+    SETTINGS_KEY: "ldoh_newapi_settings",
+    DEFAULT_INTERVAL: 60, // 默认 60 分钟
+    QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
+    MAX_CONCURRENT_REQUESTS: 10, // 最大并发请求数
+    REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
+    DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
+    LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
+    LOGIN_CHECK_MAX_ATTEMPTS: 10, // 登录检测最大尝试次数（5秒）
+    DOM: {
+      CARD_SELECTOR: ".rounded-xl.shadow.group.relative",
+      HELPER_CONTAINER_CLASS: "ldoh-helper-container",
+      STYLE_ID: "ldoh-helper-css",
+    },
+    // New API 站点特征
+    SITE_FEATURES: {
+      // API 端点特征
+      API_ENDPOINTS: ["/api/user/self", "/api/user/token", "/api/pricing"],
+      // DOM 特征（页面元素）
+      DOM_SELECTORS: [
+        'meta[name="description"][content*="API"]',
+        'title:contains("API")',
+        '[class*="api"]',
+        '[id*="api"]',
+      ],
+    },
+  };
+
+  // ==================== 日志系统 ====================
+  const Log = {
+    _print: (level, msg, color, bg, ...args) =>
+      console.log(
+        `%c LDOH %c ${level.toUpperCase()} %c ${msg}`,
+        "background: #6366f1; color: white; border-radius: 3px 0 0 3px; font-weight: bold; padding: 1px 4px",
+        `background: ${bg}; color: ${color}; border-radius: 0 3px 3px 0; font-weight: bold; padding: 1px 4px`,
+        "color: inherit; font-weight: normal",
+        ...args,
+      ),
+    info: (msg, ...args) => Log._print("info", msg, "#fff", "#3b82f6", ...args),
+    success: (msg, ...args) =>
+      Log._print("ok", msg, "#fff", "#10b981", ...args),
+    warn: (msg, ...args) => Log._print("warn", msg, "#000", "#f59e0b", ...args),
+    error: (msg, ...args) => Log._print("err", msg, "#fff", "#ef4444", ...args),
+    debug: (msg, ...args) => {
+      //   if (localStorage.getItem("ldoh_debug")) {
+      Log._print("debug", msg, "#fff", "#8b5cf6", ...args);
+      //   }
+    },
+  };
+
+  // ==================== 样式定义 ====================
+  const STYLES = `
+    :root {
+      --ldoh-primary: #6366f1;
+      --ldoh-primary-hover: #4f46e5;
+      --ldoh-success: #10b981;
+      --ldoh-warning: #f59e0b;
+      --ldoh-danger: #ef4444;
+      --ldoh-text: #1e293b;
+      --ldoh-text-light: #64748b;
+      --ldoh-bg: #ffffff;
+      --ldoh-card-bg: rgba(255, 255, 255, 0.85);
+      --ldoh-border: #e2e8f0;
+      --ldoh-radius: 12px;
+      --ldoh-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.08), 0 2px 6px -1px rgba(0, 0, 0, 0.04);
+    }
+
+    .ldoh-helper-container {
+      display: flex; align-items: center; gap: 4px; z-index: 10;
+      pointer-events: auto; animation: ldoh-fade-in 0.3s ease-out;
+    }
+    @keyframes ldoh-fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    .ldoh-info-bar {
+      display: flex; align-items: center; gap: 4px;
+      font-size: 10px; font-weight: 600; color: inherit;
+      white-space: nowrap;
+    }
+
+    .status-ok { background: var(--ldoh-success); }
+    .status-none { background: #9ca3af; }
+
+    .ldoh-btn {
+      width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+      background: transparent; border-radius: 4px; border: none;
+      cursor: pointer; color: inherit; transition: all 0.2s; flex-shrink: 0;
+    }
+    .ldoh-btn:hover { background: rgba(99, 102, 241, 0.1); color: var(--ldoh-primary); opacity: 1; transform: scale(1.1); }
+    .ldoh-btn:active { transform: scale(0.95); }
+
+    .ldoh-refresh-btn.loading svg { animation: ldoh-spin 0.8s linear infinite; }
+    @keyframes ldoh-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+    /* Dialog */
+    .ldh-overlay {
+      position: fixed; inset: 0; background: rgba(15, 23, 42, 0.4);
+      z-index: 900; display: flex; justify-content: center; align-items: center;
+      backdrop-filter: blur(6px); animation: ldoh-fade-in-blur 0.3s ease-out;
+    }
+    @keyframes ldoh-fade-in-blur { from { opacity: 0; backdrop-filter: blur(0); } to { opacity: 1; backdrop-filter: blur(6px); } }
+
+    .ldh-dialog {
+      background: #fff; width: min(680px, 94vw); max-height: 85vh;
+      border-radius: 20px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+      display: flex; flex-direction: column; overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      transform-origin: center; animation: ldoh-zoom-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    @keyframes ldoh-zoom-in { from { transform: scale(0.9) translateY(20px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
+
+    .ldh-header {
+      padding: 18px 24px; border-bottom: 1px solid var(--ldoh-border);
+      display: flex; justify-content: space-between; align-items: center;
+      background: linear-gradient(to right, #f8fafc, #ffffff);
+    }
+    .ldh-title { font-size: 16px; font-weight: 700; color: var(--ldoh-text); }
+    .ldh-close {
+      width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+      border-radius: 50%; color: var(--ldoh-text-light); cursor: pointer; transition: all 0.2s;
+    }
+    .ldh-close:hover { background: #f1f5f9; color: var(--ldoh-danger); transform: rotate(90deg); }
+
+    .ldh-content { padding: 24px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 24px; scrollbar-width: thin; }
+    .ldh-sec-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .ldh-sec-title { font-size: 14px; font-weight: 700; color: var(--ldoh-text); display: flex; align-items: center; gap: 6px; }
+    .ldh-sec-badge { font-size: 11px; padding: 2px 8px; background: #f1f5f9; border-radius: 20px; color: var(--ldoh-text-light); }
+
+    .ldh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+    .ldh-item {
+      padding: 12px; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius);
+      font-size: 12px; color: var(--ldoh-text); background: #fff; cursor: pointer;
+      position: relative; transition: all 0.2s ease;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .ldh-item:hover { border-color: var(--ldoh-primary); background: #f5f3ff; transform: translateY(-2px); box-shadow: 0 4px 12px rgba(99, 102, 241, 0.1); }
+    .ldh-item:active { transform: translateY(0); }
+
+    .ldh-item.active { border-color: var(--ldoh-primary); background: #f5f3ff; box-shadow: inset 0 0 0 1px var(--ldoh-primary); }
+
+    .ldh-quota { color: var(--ldoh-warning); font-weight: 800; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+
+    /* Toast */
+    .ldoh-toast-container { position: fixed; top: 24px; right: 24px; z-index: 950; display: flex; flex-direction: column; gap: 12px; pointer-events: none; }
+    .ldoh-toast {
+      min-width: 300px; max-width: 450px; padding: 14px 18px; background: #fff; border-radius: 14px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+      display: flex; align-items: center; gap: 12px; font-size: 14px; font-weight: 600;
+      pointer-events: auto; animation: ldoh-slide-in 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      border-left: 5px solid var(--ldoh-primary);
+    }
+    @keyframes ldoh-slide-in { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    .ldoh-toast.success { border-left-color: var(--ldoh-success); }
+    .ldoh-toast.error { border-left-color: var(--ldoh-danger); }
+    .ldoh-toast.warning { border-left-color: var(--ldoh-warning); }
+
+    .ldoh-toast-icon { width: 22px; height: 22px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+    .ldoh-toast.success .ldoh-toast-icon { background: #ecfdf5; color: var(--ldoh-success); }
+    .ldoh-toast.error .ldoh-toast-icon { background: #fef2f2; color: var(--ldoh-danger); }
+    .ldoh-toast.warning .ldoh-toast-icon { background: #fffbeb; color: var(--ldoh-warning); }
+    .ldoh-toast.info .ldoh-toast-icon { background: #f0f9ff; color: var(--ldoh-primary); }
+
+    .ldoh-toast-message { flex: 1; color: var(--ldoh-text); line-height: 1.5; }
+    .ldoh-toast-close { width: 24px; height: 24px; flex-shrink: 0; cursor: pointer; color: var(--ldoh-text-light); display: flex; align-items: center; justify-content: center; border-radius: 6px; transition: all 0.2s; }
+    .ldoh-toast-close:hover { background: #f1f5f9; color: var(--ldoh-text); }
+  `;
+
+  // ==================== 工具函数 ====================
+  const Utils = {
+    /**
+     * 注入样式表（防止重复注入）
+     */
+    injectStyles() {
+      const styleId = CONFIG.DOM.STYLE_ID;
+      if (!document.getElementById(styleId)) {
+        Log.debug("注入样式表");
+        const s = document.createElement("style");
+        s.id = styleId;
+        s.textContent = STYLES;
+        document.head.appendChild(s);
+      }
+    },
+
+    /**
+     * 从 localStorage 获取用户 ID
+     * @returns {string|null} 用户 ID 或 null
+     */
+    getUserIdFromStorage() {
+      try {
+        const userStr = localStorage.getItem("user");
+        if (!userStr) {
+          Log.debug("localStorage 中未找到 user 数据");
+          return null;
+        }
+
+        const user = JSON.parse(userStr);
+        if (!user || typeof user !== "object") {
+          Log.warn("user 数据格式无效");
+          return null;
+        }
+
+        if (user.username) {
+          const match = user.username.match(/_(\d+)$/);
+          const userId = match ? match[1] : user.id;
+          if (userId) {
+            Log.debug(`从 localStorage 获取到用户 ID: ${userId}`);
+            return userId;
+          }
+        }
+
+        Log.warn("无法从 user 数据中提取用户 ID", user);
+        return null;
+      } catch (e) {
+        Log.error("解析 localStorage user 数据失败", e);
+        return null;
+      }
+    },
+
+    /**
+     * 转换额度为美元格式
+     * @param {number} q - 额度值
+     * @returns {string} 格式化的美元金额
+     */
+    formatQuota: (q) => {
+      if (q === undefined || q === null || isNaN(q)) {
+        return "0.00";
+      }
+      return (q / CONFIG.QUOTA_CONVERSION_RATE).toFixed(2);
+    },
+
+    /**
+     * 标准化主机名（移除 www 前缀和端口）
+     * @param {string} host - 主机名
+     * @returns {string} 标准化后的主机名
+     */
+    normalizeHost: (host) => {
+      if (!host || typeof host !== "string") {
+        Log.warn("normalizeHost 收到无效的 host", host);
+        return "";
+      }
+      return host
+        .toLowerCase()
+        .split(":")[0]
+        .replace(/^www\./, "");
+    },
+
+    /**
+     * 保存站点数据到存储
+     * @param {string} host - 主机名
+     * @param {object} data - 要保存的数据
+     */
+    saveSiteData(host, data) {
+      try {
+        const all = GM_getValue(CONFIG.STORAGE_KEY, {});
+        const key = Utils.normalizeHost(host);
+        all[key] = { ...(all[key] || {}), ...data, ts: Date.now() };
+        GM_setValue(CONFIG.STORAGE_KEY, all);
+        Log.debug(`保存站点数据: ${key}`, data);
+      } catch (e) {
+        Log.error(`保存站点数据失败: ${host}`, e);
+      }
+    },
+
+    /**
+     * 从存储获取站点数据
+     * @param {string} host - 主机名
+     * @returns {object} 站点数据
+     */
+    getSiteData: (host) => {
+      try {
+        const all = GM_getValue(CONFIG.STORAGE_KEY, {});
+        const key = Utils.normalizeHost(host);
+        return all[key] || {};
+      } catch (e) {
+        Log.error(`获取站点数据失败: ${host}`, e);
+        return {};
+      }
+    },
+
+    /**
+     * 复制文本到剪贴板
+     * @param {string} text - 要复制的文本
+     */
+    copy: (text) => {
+      try {
+        GM_setClipboard(text);
+        Log.debug(`已复制到剪贴板: ${text.substring(0, 20)}...`);
+      } catch (e) {
+        Log.error("复制到剪贴板失败", e);
+      }
+    },
+
+    /**
+     * 转义 HTML 特殊字符防止 XSS
+     * @param {string} str - 要转义的字符串
+     * @returns {string} 转义后的字符串
+     */
+    escapeHtml: (str) => {
+      if (!str || typeof str !== "string") return "";
+      const div = document.createElement("div");
+      div.textContent = str;
+      return div.innerHTML;
+    },
+
+    /**
+     * 创建防抖函数
+     * @param {Function} func - 要防抖的函数
+     * @param {number} delay - 延迟时间（毫秒）
+     * @returns {Function} 防抖后的函数
+     */
+    debounce(func, delay) {
+      let timer = null;
+      return function (...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => func.apply(this, args), delay);
+      };
+    },
+
+    /**
+     * Toast 通知系统
+     */
+    toast: {
+      container: null,
+      init() {
+        if (!this.container) {
+          this.container = document.createElement("div");
+          this.container.className = "ldoh-toast-container";
+          document.body.appendChild(this.container);
+        }
+      },
+      show(message, type = "info", duration = 3000) {
+        this.init();
+        const toast = document.createElement("div");
+        toast.className = `ldoh-toast ${type}`;
+
+        const icons = {
+          success:
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>',
+          error:
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
+          warning:
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>',
+          info: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>',
+        };
+
+        toast.innerHTML = `
+          <div class="ldoh-toast-icon">${icons[type] || icons.info}</div>
+          <div class="ldoh-toast-message">${Utils.escapeHtml(message)}</div>
+          <div class="ldoh-toast-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></div>
+        `;
+
+        toast.querySelector(".ldoh-toast-close").onclick = () =>
+          this.remove(toast);
+        this.container.appendChild(toast);
+        if (duration > 0) setTimeout(() => this.remove(toast), duration);
+        return toast;
+      },
+      remove(toast) {
+        if (!toast || !toast.parentNode) return;
+        toast.style.animation = "ldoh-slide-in 0.3s ease-in reverse forwards";
+        setTimeout(() => toast.remove(), 300);
+      },
+      // 快捷方法
+      success: (msg, duration) => Utils.toast.show(msg, "success", duration),
+      error: (msg, duration) => Utils.toast.show(msg, "error", duration),
+      warning: (msg, duration) => Utils.toast.show(msg, "warning", duration),
+      info: (msg, duration) => Utils.toast.show(msg, "info", duration),
+    },
+
+    /**
+     * 检测是否为 New API 站点
+     * @param {number} retryCount - 重试次数（用于 OAuth 场景）
+     * @returns {Promise<boolean>} 是否为 New API 站点
+     */
+    async isNewApiSite(retryCount = 3) {
+      try {
+        const host = window.location.hostname;
+
+        // LDOH 站点直接返回 true
+        if (host === "ldoh.105117.xyz") {
+          return true;
+        }
+
+        // 优先检查：是否在 LDOH 已保存的站点列表中
+        const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+        const normalizedHost = this.normalizeHost(host);
+        if (allData[normalizedHost]) {
+          Log.debug(
+            `[站点识别] ${host} - 在 LDOH 站点列表中，进行 New API 站点判定`,
+          );
+          return true;
+        }
+
+        // 检查 localStorage 中是否有 user 数据（已登录过）
+        let hasUserData = !!localStorage.getItem("user");
+
+        // OAuth 场景：如果没有 user 数据，等待一会再检查
+        if (!hasUserData && retryCount > 0) {
+          Log.debug(
+            `[站点识别] ${host} - 暂无用户数据，等待 ${retryCount} 次重试...`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          return this.isNewApiSite(retryCount - 1);
+        }
+
+        if (hasUserData) {
+          Log.debug(`[站点识别] ${host} - 检测到用户数据，判定为 New API 站点`);
+          return true;
+        }
+
+        // 检查 API 端点是否可访问
+        Log.debug(`[站点识别] ${host} - 检查 API 端点...`);
+        try {
+          const response = await fetch("/api/status", {
+            method: "GET",
+            timeout: 3000,
+          });
+          if (response.ok && response.data?.data?._qn === "new-api") {
+            Log.debug(
+              `[站点识别] ${host} - API 端点可访问（_qn=new-api），判定为 New API 站点`,
+            );
+            return true;
+          }
+        } catch (e) {
+          Log.debug(`[站点识别] ${host} - API 端点不可访问`);
+        }
+
+        // 检查页面标题和元数据
+        // const title = document.title.toLowerCase();
+        // const hasApiInTitle = title.includes("公益") || title.includes("api");
+        // if (hasApiInTitle) {
+        //   Log.debug(
+        //     `[站点识别] ${host} - 标题包含 公益 或 API 关键词，判定为 New API 站点`,
+        //   );
+        //   return true;
+        // }
+
+        Log.debug(`[站点识别] ${host} - 未识别为 New API 站点`);
+        return false;
+      } catch (e) {
+        Log.error("[站点识别] 检测失败", e);
+        return false;
+      }
+    },
+
+    /**
+     * 等待用户登录（轮询检测）
+     * @returns {Promise<string|null>} 用户 ID 或 null
+     */
+    async waitForLogin() {
+      Log.debug("[登录检测] 开始等待用户登录...");
+
+      for (let i = 0; i < CONFIG.LOGIN_CHECK_MAX_ATTEMPTS; i++) {
+        const userId = this.getUserIdFromStorage();
+        if (userId) {
+          Log.success(`[登录检测] 检测到登录，用户 ID: ${userId}`);
+          return userId;
+        }
+
+        await new Promise((resolve) =>
+          setTimeout(resolve, CONFIG.LOGIN_CHECK_INTERVAL),
+        );
+      }
+
+      Log.debug("[登录检测] 超时，未检测到登录");
+      return null;
+    },
+
+    /**
+     * 监听 localStorage 变化（用于检测登录）
+     * @param {Function} callback - 回调函数
+     */
+    watchLoginStatus(callback) {
+      // 监听 storage 事件
+      window.addEventListener("storage", (e) => {
+        if (e.key === "user" && e.newValue) {
+          Log.debug("[登录监听] 检测到 user 数据变化");
+          const userId = this.getUserIdFromStorage();
+          if (userId) {
+            callback(userId);
+          }
+        }
+      });
+
+      // 轮询检测（用于同一标签页的变化）
+      let lastUserId = this.getUserIdFromStorage();
+      setInterval(() => {
+        const currentUserId = this.getUserIdFromStorage();
+        if (currentUserId && currentUserId !== lastUserId) {
+          Log.debug("[登录监听] 轮询检测到登录");
+          lastUserId = currentUserId;
+          callback(currentUserId);
+        }
+      }, CONFIG.LOGIN_CHECK_INTERVAL);
+    },
+  };
+
+  // ==================== API 请求模块 ====================
+  const API = {
+    // 并发请求队列
+    _requestQueue: [],
+    _activeRequests: 0,
+
+    /**
+     * 发送 HTTP 请求（带并发控制）
+     * @param {string} method - HTTP 方法
+     * @param {string} host - 主机名
+     * @param {string} path - 请求路径
+     * @param {string|null} token - 认证令牌
+     * @param {string|null} userId - 用户 ID
+     * @returns {Promise<object>} 响应数据
+     */
+    async request(method, host, path, token = null, userId = null) {
+      // 并发控制：等待队列
+      while (this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      this._activeRequests++;
+      Log.debug(
+        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${CONFIG.MAX_CONCURRENT_REQUESTS})`,
+      );
+
+      try {
+        const result = await new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method,
+            url: `https://${host}${path}`,
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              ...(userId ? { "New-Api-User": userId } : {}),
+            },
+            timeout: CONFIG.REQUEST_TIMEOUT,
+            onload: (res) => {
+              try {
+                const data = JSON.parse(res.responseText);
+                if (res.status >= 200 && res.status < 300) {
+                  Log.debug(`[响应成功] ${method} ${host}${path}`, data);
+                  resolve(data);
+                } else {
+                  Log.warn(
+                    `[响应错误] ${method} ${host}${path} - 状态码: ${res.status}`,
+                    data,
+                  );
+                  resolve({
+                    success: false,
+                    error: `HTTP ${res.status}`,
+                    data,
+                  });
+                }
+              } catch (e) {
+                Log.error(`[解析失败] ${method} ${host}${path}`, e);
+                resolve({ success: false, error: "解析响应失败" });
+              }
+            },
+            onerror: (err) => {
+              Log.error(`[网络错误] ${method} ${host}${path}`, err);
+              resolve({ success: false, error: "网络错误" });
+            },
+            ontimeout: () => {
+              Log.warn(`[请求超时] ${method} ${host}${path}`);
+              resolve({ success: false, error: "请求超时" });
+            },
+          });
+        });
+
+        return result;
+      } finally {
+        this._activeRequests--;
+      }
+    },
+
+    /**
+     * 更新站点状态（优化数据一致性和登录检测）
+     * @param {string} host - 主机名
+     * @param {string} userId - 用户 ID
+     * @param {boolean} force - 是否强制更新
+     * @returns {Promise<object>} 站点数据
+     */
+    async updateSiteStatus(host, userId, force = false) {
+      try {
+        let data = Utils.getSiteData(host);
+        const settings = GM_getValue(CONFIG.SETTINGS_KEY, {
+          interval: CONFIG.DEFAULT_INTERVAL,
+        });
+
+        // 检查是否需要更新（间隔逻辑）
+        if (
+          !force &&
+          data.ts &&
+          Date.now() - data.ts < settings.interval * 60 * 1000
+        ) {
+          Log.debug(
+            `[跳过更新] ${host} - 距离上次更新 ${Math.round((Date.now() - data.ts) / 60000)} 分钟`,
+          );
+          return data;
+        }
+
+        Log.info(`[开始更新] ${host} (用户: ${userId}, 强制: ${force})`);
+
+        // 获取 token（如果没有）
+        if (!data.token) {
+          Log.debug(`[获取 Token] ${host}`);
+          const tokenRes = await this.request(
+            "GET",
+            host,
+            "/api/user/token",
+            null,
+            userId,
+          );
+          if (tokenRes.success && tokenRes.data) {
+            data.token = tokenRes.data;
+            Log.success(`[Token 获取成功] ${host}`);
+          } else {
+            Log.error(`[Token 获取失败] ${host}`, tokenRes);
+            return data;
+          }
+        }
+
+        // 优先使用 checkin 数据获取 quota
+        const now = new Date();
+        const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+        Log.debug(`[获取签到数据] ${host} - 月份: ${monthStr}`);
+
+        const checkinRes = await this.request(
+          "GET",
+          host,
+          `/api/user/checkin?month=${monthStr}`,
+          data.token,
+          userId,
+        );
+
+        let quota = null;
+        let checkedInToday = false;
+        let checkinSupported = true; // 是否支持签到
+
+        if (checkinRes.success && checkinRes.data) {
+          checkedInToday = !!checkinRes.data?.stats?.checked_in_today;
+
+          // 特殊处理：wzw.pp.ua 站点的 checkin 接口不返回 quota
+          if (host === "wzw.pp.ua") {
+            Log.debug(`[签到数据] ${host} - 特殊站点，checkin 不返回余额`);
+            checkedInToday = !!checkinRes.data?.checked_in;
+            quota = null; // 需要从 /api/user/self 获取
+          } else {
+            quota = checkinRes.data?.quota;
+          }
+
+          Log.debug(
+            `[签到数据] ${host} - 已签到: ${checkedInToday}, 额度: ${quota}`,
+          );
+        } else {
+          // 无法调用 checkin 接口：旧版本或站外签到
+          Log.warn(
+            `[签到数据获取失败] ${host} - 可能不支持签到功能`,
+            checkinRes,
+          );
+          checkinSupported = false;
+          checkedInToday = null; // 标记为不支持签到
+        }
+
+        // 如果 checkin 没有返回 quota，则调用 /api/user/self
+        if (quota === null || quota === undefined) {
+          Log.debug(`[获取用户信息] ${host} - checkin 未返回 quota`);
+          const selfRes = await this.request(
+            "GET",
+            host,
+            "/api/user/self",
+            data.token,
+            userId,
+          );
+          if (selfRes.success && selfRes.data) {
+            quota = selfRes.data?.quota;
+            Log.debug(`[用户信息] ${host} - 额度: ${quota}`);
+          } else {
+            Log.error(`[用户信息获取失败] ${host}`, selfRes);
+          }
+        }
+
+        // 更新数据
+        data.quota = quota;
+        data.checkedInToday = checkedInToday;
+        data.checkinSupported = checkinSupported;
+        data.userId = userId;
+        Utils.saveSiteData(host, data);
+
+        const checkinStatus = checkinSupported
+          ? checkedInToday
+            ? "是"
+            : "否"
+          : "不支持";
+        Log.success(
+          `[更新完成] ${host} - 额度: $${Utils.formatQuota(quota)}, 签到: ${checkinStatus}`,
+        );
+        return data;
+      } catch (e) {
+        Log.error(`[更新异常] ${host}`, e);
+        return Utils.getSiteData(host);
+      }
+    },
+
+    /**
+     * 获取站点详细信息（模型和密钥）
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @returns {Promise<object>} 详细信息
+     */
+    async fetchDetails(host, token, userId) {
+      try {
+        Log.debug(`[获取详情] ${host}`);
+        const [pricingRes, tokenRes] = await Promise.all([
+          this.request("GET", host, "/api/pricing", token, userId),
+          this.request("GET", host, "/api/token/?p=1&size=1000", token, userId),
+        ]);
+
+        const models = pricingRes.success ? pricingRes.data : [];
+        const keys = tokenRes.success ? tokenRes.data?.items || [] : [];
+
+        Log.debug(
+          `[详情获取完成] ${host} - 模型: ${Array.isArray(models) ? models.length : 0}, 密钥: ${Array.isArray(keys) ? keys.length : 0}`,
+        );
+
+        return { models, keys };
+      } catch (e) {
+        Log.error(`[获取详情异常] ${host}`, e);
+        return { models: [], keys: [] };
+      }
+    },
+  };
+
+  // ==================== UI 渲染函数 ====================
+  /**
+   * 渲染卡片助手信息（带手动刷新按钮）
+   * @param {HTMLElement} card - 卡片元素
+   * @param {string} host - 主机名
+   * @param {object} data - 站点数据
+   */
+  function renderHelper(card, host, data) {
+    let container = card.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`);
+    const ut = Array.from(card.querySelectorAll("div")).find(
+      (el) =>
+        el.textContent.includes("更新时间") &&
+        (el.children.length === 0 ||
+          el.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`)),
+    );
+
+    if (!container) {
+      container = document.createElement("div");
+      container.className = CONFIG.DOM.HELPER_CONTAINER_CLASS;
+
+      if (ut) {
+        // 融入更新时间行：完美对齐且不破坏原始布局
+        ut.style.display = "flex";
+        ut.style.alignItems = "center";
+        ut.style.justifyContent = "space-between";
+        ut.style.gap = "8px";
+
+        // 确保原始文本不被挤压
+        if (ut.children.length === 0) {
+          const textSpan = document.createElement("span");
+          textSpan.textContent = ut.textContent.trim();
+          ut.textContent = "";
+          ut.appendChild(textSpan);
+        }
+        ut.appendChild(container);
+      } else {
+        container.style.position = "absolute";
+        container.style.bottom = "8px";
+        container.style.right = "8px";
+        card.appendChild(container);
+      }
+    }
+
+    const balance = Utils.formatQuota(data.quota);
+
+    container.innerHTML = "";
+
+    // 信息栏
+    const infoBar = document.createElement("div");
+    infoBar.className = "ldoh-info-bar";
+
+    const balanceSpan = document.createElement("span");
+    balanceSpan.style.color = "#d97706"; // 更深更鲜明的琥珀金
+    balanceSpan.textContent = `$${balance}`;
+    infoBar.appendChild(balanceSpan);
+
+    // 只有支持签到的站点才显示签到状态
+    if (data.checkinSupported !== false) {
+      const separator = document.createElement("span");
+      separator.style.opacity = "0.5";
+      separator.textContent = "|";
+      infoBar.appendChild(separator);
+
+      const checkinText = data.checkedInToday ? "已签到" : "未签到";
+      const checkinSpan = document.createElement("span");
+      checkinSpan.style.color = data.checkedInToday
+        ? "var(--ldoh-success)"
+        : "var(--ldoh-warning)";
+      checkinSpan.textContent = checkinText;
+      infoBar.appendChild(checkinSpan);
+    }
+
+    container.appendChild(infoBar);
+
+    // 刷新按钮 (缩小化)
+    const refreshBtn = document.createElement("div");
+    refreshBtn.className = "ldoh-btn ldoh-refresh-btn";
+    refreshBtn.title = "刷新数据";
+    refreshBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>`;
+    refreshBtn.onclick = async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (refreshBtn.classList.contains("loading")) return;
+
+      try {
+        refreshBtn.classList.add("loading");
+        const fresh = await API.updateSiteStatus(host, data.userId, true);
+        renderHelper(card, host, fresh);
+        Utils.toast.success(`${host} 数据已更新`);
+      } catch (e) {
+        Log.error(`[刷新失败] ${host}`, e);
+        Utils.toast.error("刷新失败");
+      } finally {
+        refreshBtn.classList.remove("loading");
+      }
+    };
+    container.appendChild(refreshBtn);
+
+    // 更多按钮
+    const moreBtn = document.createElement("div");
+    moreBtn.className = "ldoh-btn";
+    moreBtn.title = "密钥与模型详情";
+    moreBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`;
+    moreBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showDetailsDialog(host, data);
+    };
+    container.appendChild(moreBtn);
+  }
+
+  /**
+   * 显示详情对话框
+   * @param {string} host - 主机名
+   * @param {object} data - 站点数据
+   */
+  async function showDetailsDialog(host, data) {
+    try {
+      const overlay = UI.createOverlay(
+        '<div class="ldh-header"><div class="ldh-title">正在获取密钥和模型...</div></div><div class="ldh-content" style="align-items:center;justify-content:center;min-height:200px"><div class="ldoh-refresh-btn loading"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg></div></div>',
+      );
+
+      const details = await API.fetchDetails(host, data.token, data.userId);
+      overlay.remove();
+
+      const { models, keys } = details;
+      const keyArray = Array.isArray(keys) ? keys : [];
+      const modelArray =
+        models && Array.isArray(models.data)
+          ? models.data
+          : Array.isArray(models)
+            ? models
+            : [];
+
+      // 构建对话框内容
+      const dialog = document.createElement("div");
+      dialog.className = "ldh-dialog";
+
+      // 头部
+      const header = document.createElement("div");
+      header.className = "ldh-header";
+
+      const title = document.createElement("div");
+      title.className = "ldh-title";
+      title.textContent = host;
+      header.appendChild(title);
+
+      const closeBtn = document.createElement("div");
+      closeBtn.className = "ldh-close";
+      closeBtn.innerHTML =
+        '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+      closeBtn.onclick = () => {
+        const currentOverlay = document.querySelector(".ldh-overlay");
+        if (currentOverlay) {
+          const dialog = currentOverlay.querySelector(".ldh-dialog");
+          dialog.style.animation = "ldoh-zoom-in 0.2s ease-in reverse forwards";
+          currentOverlay.style.animation =
+            "ldoh-fade-in-blur 0.2s ease-in reverse forwards";
+          setTimeout(() => currentOverlay.remove(), 200);
+        }
+      };
+      header.appendChild(closeBtn);
+
+      dialog.appendChild(header);
+
+      // 内容区
+      const content = document.createElement("div");
+      content.className = "ldh-content";
+
+      // 密钥部分
+      const keysSecHeader = document.createElement("div");
+      keysSecHeader.className = "ldh-sec-header";
+
+      const keysTitle = document.createElement("div");
+      keysTitle.className = "ldh-sec-title";
+      keysTitle.innerHTML = `<span>🔑 密钥列表</span><span class="ldh-sec-badge">${keyArray.length}</span>`;
+      keysSecHeader.appendChild(keysTitle);
+      content.appendChild(keysSecHeader);
+
+      const keysGrid = document.createElement("div");
+      keysGrid.className = "ldh-grid";
+
+      let selectedGroup = null;
+      const modelItems = [];
+
+      if (keyArray.length) {
+        keyArray.forEach((k) => {
+          const item = document.createElement("div");
+          item.className = "ldh-item ldh-key-item";
+          item.dataset.group = k.group || "";
+          item.dataset.key = `sk-${k.key}`;
+
+          item.innerHTML = `
+            <div style="font-weight: 700; color: var(--ldoh-text)">${Utils.escapeHtml(k.name || "未命名")}</div>
+            ${k.group ? `<div style="font-size: 10px; color: var(--ldoh-primary); font-weight: 600">Group: ${Utils.escapeHtml(k.group)}</div>` : ""}
+            <div style="font-size: 10px; color: var(--ldoh-text-light); font-family: monospace; overflow: hidden; text-overflow: ellipsis">sk-${k.key.substring(0, 16)}...</div>
+          `;
+
+          item.onclick = (e) => {
+            const isAlreadyActive = item.classList.contains("active");
+            keysGrid
+              .querySelectorAll(".ldh-item")
+              .forEach((el) => el.classList.remove("active"));
+
+            if (isAlreadyActive) {
+              selectedGroup = null;
+              Utils.copy(item.dataset.key);
+              Utils.toast.success("已复制密钥");
+            } else {
+              item.classList.add("active");
+              selectedGroup = item.dataset.group;
+              Utils.copy(item.dataset.key);
+              Utils.toast.success(
+                `已选中分组 ${selectedGroup || "默认"} 并复制密钥`,
+              );
+            }
+
+            let visibleCount = 0;
+            modelItems.forEach((mi) => {
+              let isVisible = true;
+              if (selectedGroup) {
+                try {
+                  const groups = JSON.parse(mi.dataset.modelGroups || "[]");
+                  isVisible = groups.includes(selectedGroup);
+                } catch (e) {
+                  isVisible = mi.dataset.modelName
+                    .toLowerCase()
+                    .includes(selectedGroup.toLowerCase());
+                }
+              }
+              mi.style.display = isVisible ? "" : "none";
+              if (isVisible) visibleCount++;
+            });
+            modelsBadge.textContent = selectedGroup
+              ? `${visibleCount}/${modelArray.length}`
+              : modelArray.length;
+          };
+
+          keysGrid.appendChild(item);
+        });
+      } else {
+        const empty = document.createElement("div");
+        empty.style.gridColumn = "1/-1";
+        empty.style.textAlign = "center";
+        empty.style.padding = "20px";
+        empty.style.color = "var(--ldoh-text-light)";
+        empty.textContent = "暂无可用密钥";
+        keysGrid.appendChild(empty);
+      }
+      content.appendChild(keysGrid);
+
+      // 模型部分
+      const modelsSecHeader = document.createElement("div");
+      modelsSecHeader.className = "ldh-sec-header";
+
+      const modelsTitle = document.createElement("div");
+      modelsTitle.className = "ldh-sec-title";
+      modelsTitle.innerHTML = `<span>🤖 模型列表</span>`;
+      const modelsBadge = document.createElement("span");
+      modelsBadge.className = "ldh-sec-badge";
+      modelsBadge.textContent = modelArray.length;
+      modelsTitle.appendChild(modelsBadge);
+      modelsSecHeader.appendChild(modelsTitle);
+      content.appendChild(modelsSecHeader);
+
+      const modelsGrid = document.createElement("div");
+      modelsGrid.className = "ldh-grid";
+
+      if (modelArray.length) {
+        modelArray.forEach((m) => {
+          const item = document.createElement("div");
+          item.className = "ldh-item";
+          const modelName = m.model_name || m;
+          item.dataset.copy = modelName;
+          item.dataset.modelName = modelName;
+          item.dataset.modelGroups = JSON.stringify(m.enable_groups || []);
+
+          item.innerHTML = `
+            <div style="font-weight: 600">${Utils.escapeHtml(modelName)}</div>
+            <div style="font-size: 9px; color: var(--ldoh-text-light)">点击复制</div>
+          `;
+
+          item.onclick = () => {
+            Utils.copy(item.dataset.copy);
+            Utils.toast.success("已复制模型名");
+          };
+
+          modelsGrid.appendChild(item);
+          modelItems.push(item);
+        });
+      } else {
+        const empty = document.createElement("div");
+        empty.style.gridColumn = "1/-1";
+        empty.style.textAlign = "center";
+        empty.style.padding = "20px";
+        empty.style.color = "var(--ldoh-text-light)";
+        empty.textContent = "暂无可用模型";
+        modelsGrid.appendChild(empty);
+      }
+
+      content.appendChild(modelsGrid);
+      dialog.appendChild(content);
+
+      const newOverlay = UI.createOverlay("");
+      newOverlay.querySelector(".ldh-dialog").replaceWith(dialog);
+    } catch (e) {
+      Log.error(`[详情失败] ${host}`, e);
+      Utils.toast.error("获取详情失败");
+    }
+  }
+
+  // ==================== UI 工具 ====================
+  const UI = {
+    /**
+     * 创建遮罩层对话框
+     * @param {string} html - 对话框 HTML 内容
+     * @returns {HTMLElement} 遮罩层元素
+     */
+    createOverlay(html) {
+      Utils.injectStyles();
+      const ov = document.createElement("div");
+      ov.className = "ldh-overlay";
+      ov.innerHTML = `<div class="ldh-dialog">${html}</div>`;
+      ov.onclick = (e) => {
+        if (e.target === ov) {
+          const dialog = ov.querySelector(".ldh-dialog");
+          dialog.style.animation = "ldoh-zoom-in 0.2s ease-in reverse forwards";
+          ov.style.animation =
+            "ldoh-fade-in-blur 0.2s ease-in reverse forwards";
+          setTimeout(() => ov.remove(), 200);
+        }
+      };
+      document.body.appendChild(ov);
+      return ov;
+    },
+  };
+
+  // ==================== LDOH ====================
+  /**
+   * 运行 LDOH模式（扫描并渲染所有卡片）
+   */
+  function runPortalMode() {
+    try {
+      Utils.injectStyles();
+      const allCards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
+      const cards = Array.from(allCards).filter(
+        (c) => !c.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`),
+      );
+
+      if (!cards.length) {
+        Log.debug("[LDOH] 没有新卡片需要处理");
+        return;
+      }
+
+      Log.debug(`[LDOH] 发现 ${cards.length} 个新卡片`);
+
+      cards.forEach(async (card) => {
+        try {
+          const links = Array.from(card.querySelectorAll("a"));
+          const siteLink =
+            links.find(
+              (a) => a.href.startsWith("http") && !a.href.includes("linux.do"),
+            ) || links[0];
+          if (!siteLink) {
+            Log.debug("[LDOH] 卡片中未找到有效链接");
+            return;
+          }
+
+          let host;
+          try {
+            host = new URL(siteLink.href).hostname;
+          } catch (e) {
+            Log.warn("[LDOH] 无效的 URL", siteLink.href);
+            return;
+          }
+
+          const normalizedHost = Utils.normalizeHost(host);
+          const data = Utils.getSiteData(normalizedHost);
+
+          if (data.userId) {
+            Log.debug(`[LDOH] 渲染卡片: ${host}`);
+            renderHelper(card, host, data);
+
+            // 异步更新数据
+            const fresh = await API.updateSiteStatus(host, data.userId);
+            if (fresh.ts !== data.ts) {
+              Log.debug(`[LDOH] 更新卡片: ${host}`);
+              renderHelper(card, host, fresh);
+            }
+          } else {
+            // 标记为已检查，避免重复打印日志
+            if (!card.dataset.ldohChecked) {
+              card.dataset.ldohChecked = "true";
+              Log.debug(`[LDOH] 卡片 ${host} 没有用户数据，跳过`);
+            }
+          }
+        } catch (e) {
+          Log.error("[LDOH] 处理卡片失败", e);
+        }
+      });
+    } catch (e) {
+      Log.error("[LDOH] 运行失败", e);
+    }
+  }
+
+  // ==================== 初始化和清理 ====================
+  let observerInstance = null;
+  let debounceTimer = null;
+
+  /**
+   * 初始化脚本
+   */
+  async function init() {
+    try {
+      const host = window.location.hostname;
+      const isPortal = host === "ldoh.105117.xyz";
+
+      Log.info(`初始化开始 | 主机: ${host}`);
+
+      if (isPortal) {
+        // LDOH：监听 DOM 变化并渲染卡片
+        Log.info("环境: LDOH");
+        runPortalMode();
+
+        // 使用防抖的 runPortalMode
+        const debouncedRunPortalMode = Utils.debounce(
+          runPortalMode,
+          CONFIG.DEBOUNCE_DELAY,
+        );
+
+        observerInstance = new MutationObserver(() => {
+          debouncedRunPortalMode();
+        });
+
+        observerInstance.observe(document.body, {
+          childList: true,
+          subtree: true,
+        });
+
+        Log.debug("[LDOH] MutationObserver 已启动");
+      } else {
+        // 公益站：检测是否为 New API 站点
+        Log.info("环境: 公益站");
+
+        const isNewApi = await Utils.isNewApiSite();
+        if (!isNewApi) {
+          Log.info(`${host} 不是 New API 站点，脚本退出`);
+          return;
+        }
+
+        Log.success(`${host} 识别为 New API 站点`);
+
+        // 检测登录状态
+        let userId = Utils.getUserIdFromStorage();
+
+        if (userId) {
+          // 已登录：立即更新数据
+          Log.success(`识别到登录 UID: ${userId}，正在记录站点数据...`);
+          API.updateSiteStatus(window.location.host, userId, true).catch(
+            (e) => {
+              Log.error("更新站点状态失败", e);
+            },
+          );
+        } else {
+          // 未登录：等待登录或监听登录
+          Log.debug("未检测到登录状态，开始监听...");
+
+          // 先尝试等待登录（OAuth 场景）
+          userId = await Utils.waitForLogin();
+          if (userId) {
+            Log.success(`OAuth 登录成功，用户 ID: ${userId}`);
+            API.updateSiteStatus(window.location.host, userId, true).catch(
+              (e) => {
+                Log.error("更新站点状态失败", e);
+              },
+            );
+          }
+
+          // 持续监听登录状态变化
+          Utils.watchLoginStatus((newUserId) => {
+            Log.success(`检测到登录，用户 ID: ${newUserId}`);
+            Utils.toast.success("检测到登录，正在获取站点数据...");
+            API.updateSiteStatus(window.location.host, newUserId, true).catch(
+              (e) => {
+                Log.error("更新站点状态失败", e);
+              },
+            );
+          });
+        }
+      }
+
+      Log.info("初始化完成");
+    } catch (e) {
+      Log.error("初始化失败", e);
+    }
+  }
+
+  /**
+   * 清理资源（页面卸载时）
+   */
+  function cleanup() {
+    try {
+      Log.debug("清理资源...");
+
+      if (observerInstance) {
+        observerInstance.disconnect();
+        observerInstance = null;
+        Log.debug("MutationObserver 已断开");
+      }
+
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+
+      Log.debug("清理完成");
+    } catch (e) {
+      Log.error("清理失败", e);
+    }
+  }
+
+  // 页面卸载时清理
+  window.addEventListener("beforeunload", cleanup);
+
+  // 启动脚本
+  init();
+
+  // ==================== 菜单命令 ====================
+  GM_registerMenuCommand("⚙️ 设置更新间隔", () => {
+    try {
+      const current = GM_getValue(CONFIG.SETTINGS_KEY, {
+        interval: CONFIG.DEFAULT_INTERVAL,
+      }).interval;
+      const val = prompt(
+        `请输入更新间隔（分钟）\n当前值: ${current} 分钟\n建议范围: 30-120 分钟`,
+        current,
+      );
+
+      if (val === null) return; // 用户取消
+
+      const interval = parseInt(val, 10);
+      if (isNaN(interval) || interval < 1) {
+        Utils.toast.error("无效的间隔值，请输入大于 0 的整数");
+        return;
+      }
+
+      if (interval < 30) {
+        const confirm = window.confirm(
+          `⚠️ 间隔时间较短（${interval} 分钟）可能导致频繁请求。\n是否继续？`,
+        );
+        if (!confirm) return;
+      }
+
+      GM_setValue(CONFIG.SETTINGS_KEY, { interval });
+      Log.success(`更新间隔已设置为 ${interval} 分钟`);
+      Utils.toast.success(
+        `更新间隔已设置为 ${interval} 分钟，页面将刷新`,
+        2000,
+      );
+      setTimeout(() => location.reload(), 2000);
+    } catch (e) {
+      Log.error("设置更新间隔失败", e);
+      Utils.toast.error("设置失败，请查看控制台");
+    }
+  });
+
+  GM_registerMenuCommand("🔄 手动刷新所有站点", () => {
+    try {
+      const isPortal = window.location.hostname === "ldoh.105117.xyz";
+      if (!isPortal) {
+        Utils.toast.warning("此功能仅在 LDOH 页面可用");
+        return;
+      }
+
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+      const siteCount = Object.keys(allData).length;
+
+      if (siteCount === 0) {
+        Utils.toast.info("没有站点数据需要刷新");
+        return;
+      }
+
+      const confirm = window.confirm(
+        `🔄 将刷新 ${siteCount} 个站点的数据\n这可能需要一些时间，是否继续？`,
+      );
+      if (!confirm) return;
+
+      Log.info(`开始手动刷新 ${siteCount} 个站点`);
+
+      // 强制刷新所有站点
+      Object.keys(allData).forEach((host) => {
+        const data = allData[host];
+        if (data.userId) {
+          API.updateSiteStatus(host, data.userId, true).catch((e) => {
+            Log.error(`刷新站点失败: ${host}`, e);
+          });
+        }
+      });
+
+      Utils.toast.success(
+        `已开始刷新 ${siteCount} 个站点，请稍后查看结果`,
+        2000,
+      );
+      setTimeout(() => location.reload(), 2000);
+    } catch (e) {
+      Log.error("手动刷新失败", e);
+      Utils.toast.error("刷新失败，请查看控制台");
+    }
+  });
+
+  GM_registerMenuCommand("🗑️ 清理缓存", () => {
+    try {
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+      const siteCount = Object.keys(allData).length;
+
+      if (siteCount === 0) {
+        Utils.toast.info("缓存已经是空的");
+        return;
+      }
+
+      const confirm = window.confirm(
+        `⚠️ 将清除 ${siteCount} 个站点的缓存数据\n此操作不可恢复，是否继续？`,
+      );
+      if (!confirm) return;
+
+      GM_setValue(CONFIG.STORAGE_KEY, {});
+      Log.success("缓存已清理");
+      Utils.toast.success("缓存已清理，页面将刷新", 2000);
+      setTimeout(() => location.reload(), 2000);
+    } catch (e) {
+      Log.error("清理缓存失败", e);
+      Utils.toast.error("清理失败，请查看控制台");
+    }
+  });
+
+  GM_registerMenuCommand("🐛 调试：查看缓存", () => {
+    try {
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+      const settings = GM_getValue(CONFIG.SETTINGS_KEY, {
+        interval: CONFIG.DEFAULT_INTERVAL,
+      });
+
+      console.group(
+        "%c[NewAPI Helper] 调试信息",
+        "color: #8b5cf6; font-weight: bold; font-size: 14px",
+      );
+      console.log("%c配置信息", "color: #3b82f6; font-weight: bold");
+      console.log("更新间隔:", settings.interval, "分钟");
+      console.log("并发限制:", CONFIG.MAX_CONCURRENT_REQUESTS);
+      console.log("请求超时:", CONFIG.REQUEST_TIMEOUT, "毫秒");
+
+      console.log("\n%c站点数据", "color: #10b981; font-weight: bold");
+      console.log("站点数量:", Object.keys(allData).length);
+      console.table(
+        Object.entries(allData).map(([host, data]) => ({
+          站点: host,
+          用户ID: data.userId || "无",
+          额度:
+            data.quota !== undefined
+              ? `$${Utils.formatQuota(data.quota)}`
+              : "未知",
+          已签到: data.checkedInToday ? "是" : "否",
+          最后更新: data.ts
+            ? new Date(data.ts).toLocaleString("zh-CN")
+            : "从未",
+        })),
+      );
+      console.groupEnd();
+
+      Utils.toast.success("调试信息已输出到控制台，请按 F12 查看", 4000);
+    } catch (e) {
+      Log.error("查看缓存失败", e);
+      Utils.toast.error("查看失败，请查看控制台");
+    }
+  });
+
+  GM_registerMenuCommand("ℹ️ 关于", () => {
+    alert(
+      `LDOH New API Helper v2.1.0\n\n` +
+        `✨ 功能特性：\n` +
+        `• 自动同步站点额度和签到状态\n` +
+        `• 现代化的 UI 交互体验\n` +
+        `• 密钥与模型智能过滤筛选\n` +
+        `• 高性能并发请求控制系统\n\n` +
+        `🎨 界面优化：\n` +
+        `• 全新设计的现代感界面 (Tailwind Style)\n` +
+        `• 极速响应的动画与微交互\n` +
+        `• 精心调校的排版与色彩方案\n\n` +
+        `📝 作者: @JoJoJotarou\n` +
+        `📄 许可: MIT License`,
+    );
+  });
+})();
