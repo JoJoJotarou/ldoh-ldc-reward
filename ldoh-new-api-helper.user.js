@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.0
+// @version      1.0.1
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
