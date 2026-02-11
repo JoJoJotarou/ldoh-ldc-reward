@@ -1328,7 +1328,7 @@
     }
   });
 
-  GM_registerMenuCommand("🔄 手动刷新所有站点", () => {
+  GM_registerMenuCommand("🔄 手动刷新所有站点", async () => {
     try {
       const isPortal = window.location.hostname === "ldoh.105117.xyz";
       if (!isPortal) {
@@ -1351,21 +1351,57 @@
 
       Log.info(`开始手动刷新 ${siteCount} 个站点`);
 
-      // 强制刷新所有站点
-      Object.keys(allData).forEach((host) => {
+      // 创建持久的进度 toast（duration 为 0 表示不自动消失）
+      const progressToast = Utils.toast.show(
+        `正在刷新站点 0/${siteCount}...`,
+        "info",
+        0
+      );
+
+      // 跟踪完成数量
+      let completedCount = 0;
+
+      // 等待所有站点刷新完成
+      const hosts = Object.keys(allData);
+      const promises = hosts.map(async (host) => {
         const data = allData[host];
         if (data.userId) {
-          API.updateSiteStatus(host, data.userId, true).catch((e) => {
+          try {
+            await API.updateSiteStatus(host, data.userId, true);
+            completedCount++;
+            // 更新进度
+            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            if (messageEl) {
+              messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
+            }
+          } catch (e) {
             Log.error(`刷新站点失败: ${host}`, e);
-          });
+            completedCount++;
+            // 即使失败也更新进度
+            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            if (messageEl) {
+              messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
+            }
+          }
+        } else {
+          completedCount++;
+          const messageEl = progressToast.querySelector(".ldoh-toast-message");
+          if (messageEl) {
+            messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
+          }
         }
       });
 
+      await Promise.all(promises);
+
+      // 移除进度 toast
+      Utils.toast.remove(progressToast);
+
       Utils.toast.success(
-        `已开始刷新 ${siteCount} 个站点，请稍后查看结果`,
-        2000,
+        `已完成刷新 ${siteCount} 个站点，页面即将刷新`,
+        800,
       );
-      setTimeout(() => location.reload(), 2000);
+      setTimeout(() => location.reload(), 800);
     } catch (e) {
       Log.error("手动刷新失败", e);
       Utils.toast.error("刷新失败，请查看控制台");
