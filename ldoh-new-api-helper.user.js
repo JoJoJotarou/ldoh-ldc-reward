@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.1
+// @version      1.0.2
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -532,30 +532,46 @@
     // 并发请求队列
     _requestQueue: [],
     _activeRequests: 0,
+    _activeBackgroundRequests: 0, // 后台请求计数
 
     /**
-     * 发送 HTTP 请求（带并发控制）
+     * 发送 HTTP 请求（带并发控制和优先级）
      * @param {string} method - HTTP 方法
      * @param {string} host - 主机名
      * @param {string} path - 请求路径
      * @param {string|null} token - 认证令牌
      * @param {string|null} userId - 用户 ID
+     * @param {object|null} body - 请求体（用于 POST/PUT 等）
+     * @param {boolean} isInteractive - 是否为用户交互请求（高优先级）
      * @returns {Promise<object>} 响应数据
      */
-    async request(method, host, path, token = null, userId = null) {
-      // 并发控制：等待队列
-      while (this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+    async request(method, host, path, token = null, userId = null, body = null, isInteractive = false) {
+      // 并发控制：用户交互请求优先
+      if (isInteractive) {
+        // 交互请求：等待总并发数小于最大值
+        while (this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      } else {
+        // 后台请求：等待后台请求数小于限制（最多占用5个并发）
+        const MAX_BACKGROUND_REQUESTS = 5;
+        while (
+          this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS ||
+          this._activeBackgroundRequests >= MAX_BACKGROUND_REQUESTS
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        this._activeBackgroundRequests++;
       }
 
       this._activeRequests++;
       Log.debug(
-        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${CONFIG.MAX_CONCURRENT_REQUESTS})`,
+        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${CONFIG.MAX_CONCURRENT_REQUESTS}, 后台: ${this._activeBackgroundRequests}, 交互: ${isInteractive})`,
       );
 
       try {
         const result = await new Promise((resolve, reject) => {
-          GM_xmlhttpRequest({
+          const requestConfig = {
             method,
             url: `https://${host}${path}`,
             headers: {
@@ -594,12 +610,22 @@
               Log.warn(`[请求超时] ${method} ${host}${path}`);
               resolve({ success: false, error: "请求超时" });
             },
-          });
+          };
+
+          // 如果有 body，添加到请求配置中
+          if (body) {
+            requestConfig.data = JSON.stringify(body);
+          }
+
+          GM_xmlhttpRequest(requestConfig);
         });
 
         return result;
       } finally {
         this._activeRequests--;
+        if (!isInteractive) {
+          this._activeBackgroundRequests--;
+        }
       }
     },
 
@@ -743,8 +769,8 @@
       try {
         Log.debug(`[获取详情] ${host}`);
         const [pricingRes, tokenRes] = await Promise.all([
-          this.request("GET", host, "/api/pricing", token, userId),
-          this.request("GET", host, "/api/token/?p=1&size=1000", token, userId),
+          this.request("GET", host, "/api/pricing", token, userId, null, true),
+          this.request("GET", host, "/api/token/?p=1&size=1000", token, userId, null, true),
         ]);
 
         const models = pricingRes.success ? pricingRes.data : [];
@@ -758,6 +784,110 @@
       } catch (e) {
         Log.error(`[获取详情异常] ${host}`, e);
         return { models: [], keys: [] };
+      }
+    },
+
+    /**
+     * 获取用户分组列表
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @returns {Promise<object>} 分组列表
+     */
+    async fetchGroups(host, token, userId) {
+      try {
+        Log.debug(`[获取分组列表] ${host}`);
+        const res = await this.request("GET", host, "/api/user/self/groups", token, userId, null, true);
+
+        if (res.success && res.data) {
+          Log.debug(`[分组列表获取完成] ${host} - 分组数: ${Object.keys(res.data).length}`);
+          return res.data;
+        }
+
+        Log.warn(`[分组列表获取失败] ${host}`, res);
+        return {};
+      } catch (e) {
+        Log.error(`[获取分组列表异常] ${host}`, e);
+        return {};
+      }
+    },
+
+    /**
+     * 创建密钥
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @param {string} name - 密钥名称
+     * @param {string} group - 分组名称
+     * @returns {Promise<object>} 创建结果
+     */
+    async createToken(host, token, userId, name, group) {
+      try {
+        Log.debug(`[创建密钥] ${host} - 名称: ${name}, 分组: ${group}`);
+        const res = await this.request(
+          "POST",
+          host,
+          "/api/token/",
+          token,
+          userId,
+          {
+            remain_quota: 0,
+            expired_time: -1,
+            unlimited_quota: true,
+            model_limits_enabled: false,
+            model_limits: "",
+            cross_group_retry: false,
+            name: name,
+            group: group,
+            allow_ips: ""
+          },
+          true
+        );
+
+        if (res.success) {
+          Log.success(`[密钥创建成功] ${host}`);
+        } else {
+          Log.error(`[密钥创建失败] ${host}`, res);
+        }
+
+        return res;
+      } catch (e) {
+        Log.error(`[创建密钥异常] ${host}`, e);
+        return { success: false, error: "创建密钥异常" };
+      }
+    },
+
+    /**
+     * 删除密钥
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @param {number} tokenId - 密钥 ID
+     * @returns {Promise<object>} 删除结果
+     */
+    async deleteToken(host, token, userId, tokenId) {
+      try {
+        Log.debug(`[删除密钥] ${host} - ID: ${tokenId}`);
+        const res = await this.request(
+          "DELETE",
+          host,
+          `/api/token/${tokenId}`,
+          token,
+          userId,
+          null,
+          true
+        );
+
+        if (res.success) {
+          Log.success(`[密钥删除成功] ${host}`);
+        } else {
+          Log.error(`[密钥删除失败] ${host}`, res);
+        }
+
+        return res;
+      } catch (e) {
+        Log.error(`[删除密钥异常] ${host}`, e);
+        return { success: false, error: "删除密钥异常" };
       }
     },
   };
@@ -939,7 +1069,160 @@
       keysTitle.className = "ldh-sec-title";
       keysTitle.innerHTML = `<span>🔑 密钥列表</span><span class="ldh-sec-badge">${keyArray.length}</span>`;
       keysSecHeader.appendChild(keysTitle);
+
+      // 创建密钥按钮
+      const createKeyBtn = document.createElement("button");
+      createKeyBtn.style.cssText = "padding: 4px 12px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      createKeyBtn.textContent = "+ 创建密钥";
+      createKeyBtn.onmouseover = () => createKeyBtn.style.background = "var(--ldoh-primary-hover)";
+      createKeyBtn.onmouseout = () => createKeyBtn.style.background = "var(--ldoh-primary)";
+      keysSecHeader.appendChild(createKeyBtn);
+
       content.appendChild(keysSecHeader);
+
+      // 创建密钥表单（初始隐藏）
+      const createForm = document.createElement("div");
+      createForm.style.cssText = "display: none; padding: 16px; background: #f8fafc; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius); margin-bottom: 12px;";
+
+      const formGrid = document.createElement("div");
+      formGrid.style.cssText = "display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end;";
+
+      // 名称输入框
+      const nameWrapper = document.createElement("div");
+      const nameLabel = document.createElement("div");
+      nameLabel.style.cssText = "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
+      nameLabel.textContent = "密钥名称";
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.placeholder = "请输入密钥名称";
+      nameInput.style.cssText = "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s;";
+      nameInput.onfocus = () => nameInput.style.borderColor = "var(--ldoh-primary)";
+      nameInput.onblur = () => nameInput.style.borderColor = "var(--ldoh-border)";
+      nameWrapper.appendChild(nameLabel);
+      nameWrapper.appendChild(nameInput);
+      formGrid.appendChild(nameWrapper);
+
+      // 分组选择
+      const groupWrapper = document.createElement("div");
+      const groupLabel = document.createElement("div");
+      groupLabel.style.cssText = "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
+      groupLabel.textContent = "选择分组";
+      const groupSelect = document.createElement("select");
+      groupSelect.style.cssText = "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s; cursor: pointer; background: white;";
+      groupSelect.onfocus = () => groupSelect.style.borderColor = "var(--ldoh-primary)";
+      groupSelect.onblur = () => groupSelect.style.borderColor = "var(--ldoh-border)";
+      groupWrapper.appendChild(groupLabel);
+      groupWrapper.appendChild(groupSelect);
+      formGrid.appendChild(groupWrapper);
+
+      // 按钮组
+      const buttonGroup = document.createElement("div");
+      buttonGroup.style.cssText = "display: flex; gap: 8px;";
+
+      const cancelBtn = document.createElement("button");
+      cancelBtn.textContent = "取消";
+      cancelBtn.style.cssText = "padding: 8px 16px; background: #e2e8f0; color: var(--ldoh-text); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      cancelBtn.onmouseover = () => cancelBtn.style.background = "#cbd5e1";
+      cancelBtn.onmouseout = () => cancelBtn.style.background = "#e2e8f0";
+      cancelBtn.onclick = () => {
+        createForm.style.display = "none";
+        createKeyBtn.textContent = "+ 创建密钥";
+        nameInput.value = "";
+      };
+
+      const submitBtn = document.createElement("button");
+      submitBtn.textContent = "创建";
+      submitBtn.style.cssText = "padding: 8px 16px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      submitBtn.onmouseover = () => submitBtn.style.background = "var(--ldoh-primary-hover)";
+      submitBtn.onmouseout = () => submitBtn.style.background = "var(--ldoh-primary)";
+      submitBtn.onclick = async () => {
+        const name = nameInput.value.trim();
+        const group = groupSelect.value;
+
+        if (!name) {
+          Utils.toast.warning("请输入密钥名称");
+          nameInput.focus();
+          return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "创建中...";
+        submitBtn.style.opacity = "0.6";
+        submitBtn.style.cursor = "not-allowed";
+
+        try {
+          const result = await API.createToken(host, data.token, data.userId, name, group);
+
+          if (result.success) {
+            Utils.toast.success("密钥创建成功");
+            createForm.style.display = "none";
+            createKeyBtn.textContent = "+ 创建密钥";
+            nameInput.value = "";
+            // 关闭当前对话框并重新打开以刷新列表
+            const currentOverlay = document.querySelector(".ldh-overlay");
+            if (currentOverlay) {
+              currentOverlay.remove();
+            }
+            setTimeout(() => showDetailsDialog(host, data), 300);
+          } else {
+            Utils.toast.error(result.message || "密钥创建失败");
+            submitBtn.disabled = false;
+            submitBtn.textContent = "创建";
+            submitBtn.style.opacity = "1";
+            submitBtn.style.cursor = "pointer";
+          }
+        } catch (e) {
+          Log.error("创建密钥失败", e);
+          Utils.toast.error("创建密钥失败");
+          submitBtn.disabled = false;
+          submitBtn.textContent = "创建";
+          submitBtn.style.opacity = "1";
+          submitBtn.style.cursor = "pointer";
+        }
+      };
+
+      buttonGroup.appendChild(cancelBtn);
+      buttonGroup.appendChild(submitBtn);
+      formGrid.appendChild(buttonGroup);
+
+      createForm.appendChild(formGrid);
+      content.appendChild(createForm);
+
+      // 创建密钥按钮点击事件
+      createKeyBtn.onclick = async () => {
+        if (createForm.style.display === "none") {
+          // 展开表单，先获取分组列表
+          createKeyBtn.disabled = true;
+          createKeyBtn.textContent = "加载中...";
+
+          try {
+            const groups = await API.fetchGroups(host, data.token, data.userId);
+
+            // 清空并填充分组选项
+            groupSelect.innerHTML = "";
+            Object.entries(groups).forEach(([groupName, groupInfo]) => {
+              const option = document.createElement("option");
+              option.value = groupName;
+              option.textContent = `${groupName} - ${groupInfo.desc} (倍率: ${groupInfo.ratio})`;
+              groupSelect.appendChild(option);
+            });
+
+            createForm.style.display = "block";
+            createKeyBtn.textContent = "收起表单";
+            setTimeout(() => nameInput.focus(), 100);
+          } catch (e) {
+            Log.error("获取分组列表失败", e);
+            Utils.toast.error("获取分组列表失败");
+          } finally {
+            createKeyBtn.disabled = false;
+          }
+        } else {
+          // 收起表单
+          createForm.style.display = "none";
+          createKeyBtn.textContent = "+ 创建密钥";
+          nameInput.value = "";
+        }
+      };
 
       const keysGrid = document.createElement("div");
       keysGrid.className = "ldh-grid";
@@ -953,6 +1236,7 @@
           item.className = "ldh-item ldh-key-item";
           item.dataset.group = k.group || "";
           item.dataset.key = `sk-${k.key}`;
+          item.style.position = "relative";
 
           item.innerHTML = `
             <div style="font-weight: 700; color: var(--ldoh-text)">${Utils.escapeHtml(k.name || "未命名")}</div>
@@ -960,7 +1244,71 @@
             <div style="font-size: 10px; color: var(--ldoh-text-light); font-family: monospace; overflow: hidden; text-overflow: ellipsis">sk-${k.key.substring(0, 16)}...</div>
           `;
 
+          // 删除按钮
+          const deleteBtn = document.createElement("div");
+          deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
+          deleteBtn.style.cssText = "position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; border-radius: 4px; cursor: pointer; opacity: 0; transition: all 0.2s; color: var(--ldoh-danger);";
+          deleteBtn.title = "删除密钥";
+
+          deleteBtn.onmouseover = () => {
+            deleteBtn.style.background = "rgba(239, 68, 68, 0.1)";
+          };
+          deleteBtn.onmouseout = () => {
+            deleteBtn.style.background = "transparent";
+          };
+
+          deleteBtn.onclick = async (e) => {
+            e.stopPropagation();
+
+            const confirmDelete = window.confirm(`确定要删除密钥 "${k.name || "未命名"}" 吗？\n\n此操作不可恢复！`);
+            if (!confirmDelete) return;
+
+            try {
+              deleteBtn.style.opacity = "0.5";
+              deleteBtn.style.cursor = "not-allowed";
+
+              const result = await API.deleteToken(host, data.token, data.userId, k.id);
+
+              if (result.success) {
+                Utils.toast.success("密钥删除成功");
+                // 从 DOM 中移除该项
+                item.style.animation = "ldoh-slide-in 0.3s ease-in reverse forwards";
+                setTimeout(() => {
+                  item.remove();
+                  // 更新密钥数量徽章
+                  const badge = document.querySelector(".ldh-sec-title .ldh-sec-badge");
+                  if (badge) {
+                    const currentCount = parseInt(badge.textContent) || 0;
+                    badge.textContent = Math.max(0, currentCount - 1);
+                  }
+                }, 300);
+              } else {
+                Utils.toast.error(result.message || "密钥删除失败");
+                deleteBtn.style.opacity = "1";
+                deleteBtn.style.cursor = "pointer";
+              }
+            } catch (e) {
+              Log.error("删除密钥失败", e);
+              Utils.toast.error("删除密钥失败");
+              deleteBtn.style.opacity = "1";
+              deleteBtn.style.cursor = "pointer";
+            }
+          };
+
+          item.appendChild(deleteBtn);
+
+          // 鼠标悬停时显示删除按钮
+          item.onmouseenter = () => {
+            deleteBtn.style.opacity = "1";
+          };
+          item.onmouseleave = () => {
+            deleteBtn.style.opacity = "0";
+          };
+
           item.onclick = (e) => {
+            // 如果点击的是删除按钮，不执行复制逻辑
+            if (e.target.closest("div") === deleteBtn) return;
+
             const isAlreadyActive = item.classList.contains("active");
             keysGrid
               .querySelectorAll(".ldh-item")
