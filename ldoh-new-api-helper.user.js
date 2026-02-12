@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.2
+// @version      1.0.3
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -16,10 +16,25 @@
 // @license      MIT
 // ==/UserScript==
 
+/**
+ * 版本更新日志
+ *
+ * v1.0.3 (2026-02-12)
+ * - 新增：LDOH 站点白名单机制，只识别 LDOH 卡片中的站点（白名单仅在页面加载时更新一次，避免频繁更新和筛选影响）
+ * - 优化：两步验证机制（白名单检查 + New API 特征检测）
+ *
+ * v1.0.2
+ * - 新增：密钥管理功能（创建、删除）
+ * - 优化：请求并发控制和优先级
+ *
+ * v1.0.1
+ * - 初始版本：余额查询、签到状态、模型列表
+ */
+
 (function () {
   "use strict";
 
-  // 只在顶级窗口运行，屏蔽 Iframe 里的“串味”日志和执行
+  // 只在顶级窗口运行，屏蔽 Iframe 里的"串味"日志和执行
   if (window.top !== window.self) return;
   if (window.__LDOH_HELPER_RUNNING__) return;
   window.__LDOH_HELPER_RUNNING__ = true;
@@ -28,6 +43,7 @@
   const CONFIG = {
     STORAGE_KEY: "ldoh_newapi_data",
     SETTINGS_KEY: "ldoh_newapi_settings",
+    WHITELIST_KEY: "ldoh_site_whitelist", // LDOH 站点白名单
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
     MAX_CONCURRENT_REQUESTS: 10, // 最大并发请求数
@@ -39,18 +55,6 @@
       CARD_SELECTOR: ".rounded-xl.shadow.group.relative",
       HELPER_CONTAINER_CLASS: "ldoh-helper-container",
       STYLE_ID: "ldoh-helper-css",
-    },
-    // New API 站点特征
-    SITE_FEATURES: {
-      // API 端点特征
-      API_ENDPOINTS: ["/api/user/self", "/api/user/token", "/api/pricing"],
-      // DOM 特征（页面元素）
-      DOM_SELECTORS: [
-        'meta[name="description"][content*="API"]',
-        'title:contains("API")',
-        '[class*="api"]',
-        '[id*="api"]',
-      ],
     },
   };
 
@@ -77,7 +81,8 @@
       Log._print("ok", msg, "#fff", "#10b981", ...args),
     warn: (msg, ...args) => Log._print("warn", msg, "#000", "#f59e0b", ...args),
     error: (msg, ...args) => Log._print("err", msg, "#fff", "#ef4444", ...args),
-    debug: (msg, ...args) => Log._printDebug("debug", msg, "#fff", "#8b5cf6", ...args),
+    debug: (msg, ...args) =>
+      Log._printDebug("debug", msg, "#fff", "#8b5cf6", ...args),
   };
 
   // ==================== 样式定义 ====================
@@ -400,7 +405,7 @@
     },
 
     /**
-     * 检测是否为 New API 站点
+     * 检测是否为 New API 站点（需同时满足：在白名单中 + 符合 New API 特征）
      * @param {number} retryCount - 重试次数（用于 OAuth 场景）
      * @returns {Promise<boolean>} 是否为 New API 站点
      */
@@ -413,16 +418,20 @@
           return true;
         }
 
-        // 优先检查：是否在 LDOH 已保存的站点列表中
-        const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+        // 第一步：检查是否在 LDOH 站点白名单中
+        const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
         const normalizedHost = this.normalizeHost(host);
-        if (allData[normalizedHost]) {
-          Log.debug(
-            `[站点识别] ${host} - 在 LDOH 站点列表中，进行 New API 站点判定`,
-          );
-          return true;
+
+        if (!whitelist.includes(normalizedHost)) {
+          Log.debug(`[站点识别] ${host} - 不在 LDOH 站点白名单中，跳过`);
+          return false;
         }
 
+        Log.debug(
+          `[站点识别] ${host} - 在 LDOH 白名单中，继续检测 New API 特征`,
+        );
+
+        // 第二步：检查是否符合 New API 站点特征
         // 检查 localStorage 中是否有 user 数据（已登录过）
         let hasUserData = !!localStorage.getItem("user");
 
@@ -457,21 +466,49 @@
           Log.debug(`[站点识别] ${host} - API 端点不可访问`);
         }
 
-        // 检查页面标题和元数据
-        // const title = document.title.toLowerCase();
-        // const hasApiInTitle = title.includes("公益") || title.includes("api");
-        // if (hasApiInTitle) {
-        //   Log.debug(
-        //     `[站点识别] ${host} - 标题包含 公益 或 API 关键词，判定为 New API 站点`,
-        //   );
-        //   return true;
-        // }
-
         Log.debug(`[站点识别] ${host} - 未识别为 New API 站点`);
         return false;
       } catch (e) {
         Log.error("[站点识别] 检测失败", e);
         return false;
+      }
+    },
+
+    /**
+     * 更新 LDOH 站点白名单（从卡片中提取所有站点域名）
+     */
+    updateSiteWhitelist() {
+      try {
+        const cards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
+        const hosts = new Set();
+
+        cards.forEach((card) => {
+          const links = Array.from(card.querySelectorAll("a"));
+          const siteLink =
+            links.find(
+              (a) => a.href.startsWith("http") && !a.href.includes("linux.do"),
+            ) || links[0];
+
+          if (siteLink) {
+            try {
+              const host = new URL(siteLink.href).hostname;
+              const normalizedHost = this.normalizeHost(host);
+              if (normalizedHost) {
+                hosts.add(normalizedHost);
+              }
+            } catch (e) {
+              // 忽略无效 URL
+            }
+          }
+        });
+
+        const whitelist = Array.from(hosts);
+        GM_setValue(CONFIG.WHITELIST_KEY, whitelist);
+        Log.debug(`[白名单更新] 共 ${whitelist.length} 个站点`, whitelist);
+        return whitelist;
+      } catch (e) {
+        Log.error("[白名单更新] 更新失败", e);
+        return [];
       }
     },
 
@@ -545,7 +582,15 @@
      * @param {boolean} isInteractive - 是否为用户交互请求（高优先级）
      * @returns {Promise<object>} 响应数据
      */
-    async request(method, host, path, token = null, userId = null, body = null, isInteractive = false) {
+    async request(
+      method,
+      host,
+      path,
+      token = null,
+      userId = null,
+      body = null,
+      isInteractive = false,
+    ) {
       // 并发控制：用户交互请求优先
       if (isInteractive) {
         // 交互请求：等待总并发数小于最大值
@@ -770,7 +815,15 @@
         Log.debug(`[获取详情] ${host}`);
         const [pricingRes, tokenRes] = await Promise.all([
           this.request("GET", host, "/api/pricing", token, userId, null, true),
-          this.request("GET", host, "/api/token/?p=1&size=1000", token, userId, null, true),
+          this.request(
+            "GET",
+            host,
+            "/api/token/?p=1&size=1000",
+            token,
+            userId,
+            null,
+            true,
+          ),
         ]);
 
         const models = pricingRes.success ? pricingRes.data : [];
@@ -797,10 +850,20 @@
     async fetchGroups(host, token, userId) {
       try {
         Log.debug(`[获取分组列表] ${host}`);
-        const res = await this.request("GET", host, "/api/user/self/groups", token, userId, null, true);
+        const res = await this.request(
+          "GET",
+          host,
+          "/api/user/self/groups",
+          token,
+          userId,
+          null,
+          true,
+        );
 
         if (res.success && res.data) {
-          Log.debug(`[分组列表获取完成] ${host} - 分组数: ${Object.keys(res.data).length}`);
+          Log.debug(
+            `[分组列表获取完成] ${host} - 分组数: ${Object.keys(res.data).length}`,
+          );
           return res.data;
         }
 
@@ -839,9 +902,9 @@
             cross_group_retry: false,
             name: name,
             group: group,
-            allow_ips: ""
+            allow_ips: "",
           },
-          true
+          true,
         );
 
         if (res.success) {
@@ -875,7 +938,7 @@
           token,
           userId,
           null,
-          true
+          true,
         );
 
         if (res.success) {
@@ -1072,32 +1135,41 @@
 
       // 创建密钥按钮
       const createKeyBtn = document.createElement("button");
-      createKeyBtn.style.cssText = "padding: 4px 12px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      createKeyBtn.style.cssText =
+        "padding: 4px 12px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
       createKeyBtn.textContent = "+ 创建密钥";
-      createKeyBtn.onmouseover = () => createKeyBtn.style.background = "var(--ldoh-primary-hover)";
-      createKeyBtn.onmouseout = () => createKeyBtn.style.background = "var(--ldoh-primary)";
+      createKeyBtn.onmouseover = () =>
+        (createKeyBtn.style.background = "var(--ldoh-primary-hover)");
+      createKeyBtn.onmouseout = () =>
+        (createKeyBtn.style.background = "var(--ldoh-primary)");
       keysSecHeader.appendChild(createKeyBtn);
 
       content.appendChild(keysSecHeader);
 
       // 创建密钥表单（初始隐藏）
       const createForm = document.createElement("div");
-      createForm.style.cssText = "display: none; padding: 16px; background: #f8fafc; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius); margin-bottom: 12px;";
+      createForm.style.cssText =
+        "display: none; padding: 16px; background: #f8fafc; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius); margin-bottom: 12px;";
 
       const formGrid = document.createElement("div");
-      formGrid.style.cssText = "display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end;";
+      formGrid.style.cssText =
+        "display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end;";
 
       // 名称输入框
       const nameWrapper = document.createElement("div");
       const nameLabel = document.createElement("div");
-      nameLabel.style.cssText = "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
+      nameLabel.style.cssText =
+        "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
       nameLabel.textContent = "密钥名称";
       const nameInput = document.createElement("input");
       nameInput.type = "text";
       nameInput.placeholder = "请输入密钥名称";
-      nameInput.style.cssText = "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s;";
-      nameInput.onfocus = () => nameInput.style.borderColor = "var(--ldoh-primary)";
-      nameInput.onblur = () => nameInput.style.borderColor = "var(--ldoh-border)";
+      nameInput.style.cssText =
+        "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s;";
+      nameInput.onfocus = () =>
+        (nameInput.style.borderColor = "var(--ldoh-primary)");
+      nameInput.onblur = () =>
+        (nameInput.style.borderColor = "var(--ldoh-border)");
       nameWrapper.appendChild(nameLabel);
       nameWrapper.appendChild(nameInput);
       formGrid.appendChild(nameWrapper);
@@ -1105,12 +1177,16 @@
       // 分组选择
       const groupWrapper = document.createElement("div");
       const groupLabel = document.createElement("div");
-      groupLabel.style.cssText = "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
+      groupLabel.style.cssText =
+        "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
       groupLabel.textContent = "选择分组";
       const groupSelect = document.createElement("select");
-      groupSelect.style.cssText = "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s; cursor: pointer; background: white;";
-      groupSelect.onfocus = () => groupSelect.style.borderColor = "var(--ldoh-primary)";
-      groupSelect.onblur = () => groupSelect.style.borderColor = "var(--ldoh-border)";
+      groupSelect.style.cssText =
+        "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s; cursor: pointer; background: white;";
+      groupSelect.onfocus = () =>
+        (groupSelect.style.borderColor = "var(--ldoh-primary)");
+      groupSelect.onblur = () =>
+        (groupSelect.style.borderColor = "var(--ldoh-border)");
       groupWrapper.appendChild(groupLabel);
       groupWrapper.appendChild(groupSelect);
       formGrid.appendChild(groupWrapper);
@@ -1121,9 +1197,10 @@
 
       const cancelBtn = document.createElement("button");
       cancelBtn.textContent = "取消";
-      cancelBtn.style.cssText = "padding: 8px 16px; background: #e2e8f0; color: var(--ldoh-text); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
-      cancelBtn.onmouseover = () => cancelBtn.style.background = "#cbd5e1";
-      cancelBtn.onmouseout = () => cancelBtn.style.background = "#e2e8f0";
+      cancelBtn.style.cssText =
+        "padding: 8px 16px; background: #e2e8f0; color: var(--ldoh-text); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      cancelBtn.onmouseover = () => (cancelBtn.style.background = "#cbd5e1");
+      cancelBtn.onmouseout = () => (cancelBtn.style.background = "#e2e8f0");
       cancelBtn.onclick = () => {
         createForm.style.display = "none";
         createKeyBtn.textContent = "+ 创建密钥";
@@ -1132,9 +1209,12 @@
 
       const submitBtn = document.createElement("button");
       submitBtn.textContent = "创建";
-      submitBtn.style.cssText = "padding: 8px 16px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
-      submitBtn.onmouseover = () => submitBtn.style.background = "var(--ldoh-primary-hover)";
-      submitBtn.onmouseout = () => submitBtn.style.background = "var(--ldoh-primary)";
+      submitBtn.style.cssText =
+        "padding: 8px 16px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
+      submitBtn.onmouseover = () =>
+        (submitBtn.style.background = "var(--ldoh-primary-hover)");
+      submitBtn.onmouseout = () =>
+        (submitBtn.style.background = "var(--ldoh-primary)");
       submitBtn.onclick = async () => {
         const name = nameInput.value.trim();
         const group = groupSelect.value;
@@ -1151,7 +1231,13 @@
         submitBtn.style.cursor = "not-allowed";
 
         try {
-          const result = await API.createToken(host, data.token, data.userId, name, group);
+          const result = await API.createToken(
+            host,
+            data.token,
+            data.userId,
+            name,
+            group,
+          );
 
           if (result.success) {
             Utils.toast.success("密钥创建成功");
@@ -1246,8 +1332,10 @@
 
           // 删除按钮
           const deleteBtn = document.createElement("div");
-          deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
-          deleteBtn.style.cssText = "position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; border-radius: 4px; cursor: pointer; opacity: 0; transition: all 0.2s; color: var(--ldoh-danger);";
+          deleteBtn.innerHTML =
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
+          deleteBtn.style.cssText =
+            "position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; border-radius: 4px; cursor: pointer; opacity: 0; transition: all 0.2s; color: var(--ldoh-danger);";
           deleteBtn.title = "删除密钥";
 
           deleteBtn.onmouseover = () => {
@@ -1260,23 +1348,33 @@
           deleteBtn.onclick = async (e) => {
             e.stopPropagation();
 
-            const confirmDelete = window.confirm(`确定要删除密钥 "${k.name || "未命名"}" 吗？\n\n此操作不可恢复！`);
+            const confirmDelete = window.confirm(
+              `确定要删除密钥 "${k.name || "未命名"}" 吗？\n\n此操作不可恢复！`,
+            );
             if (!confirmDelete) return;
 
             try {
               deleteBtn.style.opacity = "0.5";
               deleteBtn.style.cursor = "not-allowed";
 
-              const result = await API.deleteToken(host, data.token, data.userId, k.id);
+              const result = await API.deleteToken(
+                host,
+                data.token,
+                data.userId,
+                k.id,
+              );
 
               if (result.success) {
                 Utils.toast.success("密钥删除成功");
                 // 从 DOM 中移除该项
-                item.style.animation = "ldoh-slide-in 0.3s ease-in reverse forwards";
+                item.style.animation =
+                  "ldoh-slide-in 0.3s ease-in reverse forwards";
                 setTimeout(() => {
                   item.remove();
                   // 更新密钥数量徽章
-                  const badge = document.querySelector(".ldh-sec-title .ldh-sec-badge");
+                  const badge = document.querySelector(
+                    ".ldh-sec-title .ldh-sec-badge",
+                  );
                   if (badge) {
                     const currentCount = parseInt(badge.textContent) || 0;
                     badge.textContent = Math.max(0, currentCount - 1);
@@ -1454,6 +1552,7 @@
   function runPortalMode() {
     try {
       Utils.injectStyles();
+
       const allCards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
       const cards = Array.from(allCards).filter(
         (c) => !c.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`),
@@ -1532,6 +1631,31 @@
       if (isPortal) {
         // LDOH：监听 DOM 变化并渲染卡片
         Log.info("环境: LDOH");
+
+        // 等待卡片加载完成后更新白名单（只执行一次）
+        const initWhitelist = async () => {
+          // 等待卡片加载（最多等待 5 秒）
+          let attempts = 0;
+          const maxAttempts = 10;
+          while (attempts < maxAttempts) {
+            const cards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
+            if (cards.length > 0) {
+              Log.debug(`[LDOH] 检测到 ${cards.length} 个卡片，更新白名单`);
+              Utils.updateSiteWhitelist();
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            attempts++;
+          }
+          if (attempts >= maxAttempts) {
+            Log.warn("[LDOH] 等待卡片加载超时，使用现有白名单");
+          }
+        };
+
+        // 异步初始化白名单
+        initWhitelist();
+
+        // 立即运行一次
         runPortalMode();
 
         // 使用防抖的 runPortalMode
@@ -1556,7 +1680,7 @@
 
         const isNewApi = await Utils.isNewApiSite();
         if (!isNewApi) {
-          Log.info(`${host} 不是 New API 站点，脚本退出`);
+          Log.info(`${host} 不在 LDOH 白名单中或者不是 New API 站点，脚本退出`);
           return;
         }
 
@@ -1703,7 +1827,7 @@
       const progressToast = Utils.toast.show(
         `正在刷新站点 0/${siteCount}...`,
         "info",
-        0
+        0,
       );
 
       // 跟踪完成数量
@@ -1718,7 +1842,9 @@
             await API.updateSiteStatus(host, data.userId, true);
             completedCount++;
             // 更新进度
-            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
             if (messageEl) {
               messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
             }
@@ -1726,7 +1852,9 @@
             Log.error(`刷新站点失败: ${host}`, e);
             completedCount++;
             // 即使失败也更新进度
-            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
             if (messageEl) {
               messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
             }
@@ -1745,10 +1873,7 @@
       // 移除进度 toast
       Utils.toast.remove(progressToast);
 
-      Utils.toast.success(
-        `已完成刷新 ${siteCount} 个站点，页面即将刷新`,
-        800,
-      );
+      Utils.toast.success(`已完成刷新 ${siteCount} 个站点，页面即将刷新`, 800);
       setTimeout(() => location.reload(), 800);
     } catch (e) {
       Log.error("手动刷新失败", e);
@@ -1787,6 +1912,7 @@
       const settings = GM_getValue(CONFIG.SETTINGS_KEY, {
         interval: CONFIG.DEFAULT_INTERVAL,
       });
+      const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
 
       console.group(
         "%c[NewAPI Helper] 调试信息",
@@ -1796,6 +1922,10 @@
       console.log("更新间隔:", settings.interval, "分钟");
       console.log("并发限制:", CONFIG.MAX_CONCURRENT_REQUESTS);
       console.log("请求超时:", CONFIG.REQUEST_TIMEOUT, "毫秒");
+
+      console.log("\n%c站点白名单", "color: #f59e0b; font-weight: bold");
+      console.log("白名单站点数量:", whitelist.length);
+      console.log("白名单站点列表:", whitelist);
 
       console.log("\n%c站点数据", "color: #10b981; font-weight: bold");
       console.log("站点数量:", Object.keys(allData).length);
@@ -1824,12 +1954,13 @@
 
   GM_registerMenuCommand("ℹ️ 关于", () => {
     alert(
-      `LDOH New API Helper v2.1.0\n\n` +
+      `LDOH New API Helper v1.0.3\n\n` +
         `✨ 功能特性：\n` +
         `• 自动同步站点额度和签到状态\n` +
         `• 现代化的 UI 交互体验\n` +
         `• 密钥与模型智能过滤筛选\n` +
-        `• 高性能并发请求控制系统\n\n` +
+        `• 高性能并发请求控制系统\n` +
+        `• 仅识别 LDOH 白名单中的站点\n\n` +
         `🎨 界面优化：\n` +
         `• 全新设计的现代感界面 (Tailwind Style)\n` +
         `• 极速响应的动画与微交互\n` +
