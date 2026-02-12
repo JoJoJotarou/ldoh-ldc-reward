@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.4
+// @version      1.0.5
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,10 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.5 (2026-02-12)
+ * - bug：修复签到状态接口获取余额错误的问题
+ * - 优化：增加并发数到 15 个，后台请求最多占用 10 个并发（之前是 5 个），提升性能和响应速度
  *
  * v1.0.4 (2026-02-12)
  * - 优化： new api id 获取逻辑，使用 user.id 更可靠
@@ -49,7 +53,7 @@
     WHITELIST_KEY: "ldoh_site_whitelist", // LDOH 站点白名单
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
-    MAX_CONCURRENT_REQUESTS: 10, // 最大并发请求数
+    MAX_CONCURRENT_REQUESTS: 15, // 最大并发请求数
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
     DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
     LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
@@ -600,8 +604,8 @@
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
       } else {
-        // 后台请求：等待后台请求数小于限制（最多占用5个并发）
-        const MAX_BACKGROUND_REQUESTS = 5;
+        // 后台请求：等待后台请求数小于限制（最多占用10个并发）
+        const MAX_BACKGROUND_REQUESTS = 10;
         while (
           this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS ||
           this._activeBackgroundRequests >= MAX_BACKGROUND_REQUESTS
@@ -743,14 +747,12 @@
         if (checkinRes.success && checkinRes.data) {
           checkedInToday = !!checkinRes.data?.stats?.checked_in_today;
 
-          // 特殊处理：wzw.pp.ua 站点的 checkin 接口不返回 quota
+          // 特殊处理：wzw.pp.ua (WONG 公益站)
           if (host === "wzw.pp.ua") {
             Log.debug(`[签到数据] ${host} - 特殊站点，checkin 不返回余额`);
             checkedInToday = !!checkinRes.data?.checked_in;
-            quota = null; // 需要从 /api/user/self 获取
-          } else {
-            quota = checkinRes.data?.quota;
           }
+          quota = checkinRes.data?.stats?.total_quota || null;
 
           Log.debug(
             `[签到数据] ${host} - 已签到: ${checkedInToday}, 额度: ${quota}`,
