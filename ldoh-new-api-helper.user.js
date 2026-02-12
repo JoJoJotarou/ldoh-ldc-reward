@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.5
+// @version      1.0.6
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,9 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.6 (2026-02-12)
+ * - bug：修复签到状态接口返回余额不正确的问题（统一从/api/user/self接口获取余额）
  *
  * v1.0.5 (2026-02-12)
  * - bug：修复签到状态接口获取余额错误的问题
@@ -727,9 +730,28 @@
           }
         }
 
-        // 优先使用 checkin 数据获取 quota
+        // 第一步：从 /api/user/self 获取余额
+        Log.debug(`[获取用户信息] ${host}`);
+        const selfRes = await this.request(
+          "GET",
+          host,
+          "/api/user/self",
+          data.token,
+          userId,
+        );
+
+        let quota = null;
+        if (selfRes.success && selfRes.data) {
+          quota = selfRes.data?.quota;
+          Log.debug(`[用户信息] ${host} - 额度: ${quota}`);
+        } else {
+          Log.error(`[用户信息获取失败] ${host}`, selfRes);
+        }
+
+        // 第二步：从签到接口获取签到状态
         const now = new Date();
         const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+        const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
         Log.debug(`[获取签到数据] ${host} - 月份: ${monthStr}`);
 
         const checkinRes = await this.request(
@@ -740,22 +762,26 @@
           userId,
         );
 
-        let quota = null;
         let checkedInToday = false;
         let checkinSupported = true; // 是否支持签到
+        let lastCheckinDate = data.lastCheckinDate || null; // 保留原有的签到日期
 
         if (checkinRes.success && checkinRes.data) {
           checkedInToday = !!checkinRes.data?.stats?.checked_in_today;
 
           // 特殊处理：wzw.pp.ua (WONG 公益站)
           if (host === "wzw.pp.ua") {
-            Log.debug(`[签到数据] ${host} - 特殊站点，checkin 不返回余额`);
+            Log.debug(`[签到数据] ${host} - 特殊站点`);
             checkedInToday = !!checkinRes.data?.checked_in;
           }
-          quota = checkinRes.data?.stats?.total_quota || null;
+
+          // 如果已签到，更新签到日期为今天
+          if (checkedInToday) {
+            lastCheckinDate = todayStr;
+          }
 
           Log.debug(
-            `[签到数据] ${host} - 已签到: ${checkedInToday}, 额度: ${quota}`,
+            `[签到数据] ${host} - 已签到: ${checkedInToday}, 签到日期: ${lastCheckinDate}`,
           );
         } else {
           // 无法调用 checkin 接口：旧版本或站外签到
@@ -767,28 +793,11 @@
           checkedInToday = null; // 标记为不支持签到
         }
 
-        // 如果 checkin 没有返回 quota，则调用 /api/user/self
-        if (quota === null || quota === undefined) {
-          Log.debug(`[获取用户信息] ${host} - checkin 未返回 quota`);
-          const selfRes = await this.request(
-            "GET",
-            host,
-            "/api/user/self",
-            data.token,
-            userId,
-          );
-          if (selfRes.success && selfRes.data) {
-            quota = selfRes.data?.quota;
-            Log.debug(`[用户信息] ${host} - 额度: ${quota}`);
-          } else {
-            Log.error(`[用户信息获取失败] ${host}`, selfRes);
-          }
-        }
-
         // 更新数据
         data.quota = quota;
         data.checkedInToday = checkedInToday;
         data.checkinSupported = checkinSupported;
+        data.lastCheckinDate = lastCheckinDate;
         data.userId = userId;
         Utils.saveSiteData(host, data);
 
