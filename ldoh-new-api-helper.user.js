@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.3
+// @version      1.0.4
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,9 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.4 (2026-02-12)
+ * - 优化： new api id 获取逻辑，使用 user.id 更可靠
  *
  * v1.0.3 (2026-02-12)
  * - 新增：LDOH 站点白名单机制，只识别 LDOH 卡片中的站点（白名单仅在页面加载时更新一次，避免频繁更新和筛选影响）
@@ -236,9 +239,8 @@
           return null;
         }
 
-        if (user.username) {
-          const match = user.username.match(/_(\d+)$/);
-          const userId = match ? match[1] : user.id;
+        if (user.id) {
+          const userId = user.id;
           if (userId) {
             Log.debug(`从 localStorage 获取到用户 ID: ${userId}`);
             return userId;
