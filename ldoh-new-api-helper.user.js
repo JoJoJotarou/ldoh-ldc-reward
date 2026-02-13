@@ -2012,54 +2012,102 @@
       let timeoutCount = 0;
       let completedCount = 0;
 
-      // 签到所有站点
-      const promises = sites.map(async ([host, data]) => {
+      // 失败的站点列表（用于重试）
+      const failedSites = [];
+
+      // 签到单个站点的函数
+      const checkinSite = async (host, data, updateProgress = true) => {
         try {
           const result = await API.checkin(host, data.token, data.userId);
 
-          completedCount++;
-
-          // 更新进度
-          const messageEl = progressToast.querySelector(".ldoh-toast-message");
-          if (messageEl) {
-            messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+          if (updateProgress) {
+            completedCount++;
+            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            if (messageEl) {
+              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+            }
           }
 
           if (result.success) {
             successCount++;
-            // 更新站点数据中的签到状态（使用日期）
             const siteData = Utils.getSiteData(host);
-            siteData.lastCheckinDate = today; // 使用日期字符串
-            siteData.checkedInToday = true; // 兼容旧版本显示
+            siteData.lastCheckinDate = today;
+            siteData.checkedInToday = true;
             if (result.data?.quota_awarded) {
-              siteData.quota =
-                (siteData.quota || 0) + result.data.quota_awarded;
+              siteData.quota = (siteData.quota || 0) + result.data.quota_awarded;
             }
             Utils.saveSiteData(host, siteData);
+            return true; // 成功
           } else if (result.alreadyCheckedIn) {
-            // 接口返回"今日已签到"，视为签到成功
             alreadyCheckedCount++;
             const siteData = Utils.getSiteData(host);
             siteData.lastCheckinDate = today;
             siteData.checkedInToday = true;
             Utils.saveSiteData(host, siteData);
+            return true; // 成功
           } else if (result.error === "签到超时（15秒）") {
             timeoutCount++;
+            return false; // 失败，可重试
           } else {
             failCount++;
+            return false; // 失败，可重试
           }
         } catch (e) {
           Log.error(`签到站点失败: ${host}`, e);
           failCount++;
-          completedCount++;
-          const messageEl = progressToast.querySelector(".ldoh-toast-message");
-          if (messageEl) {
-            messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+          if (updateProgress) {
+            completedCount++;
+            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            if (messageEl) {
+              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+            }
           }
+          return false; // 失败，可重试
+        }
+      };
+
+      // 第一轮签到所有站点
+      const promises = sites.map(async ([host, data]) => {
+        const success = await checkinSite(host, data);
+        if (!success) {
+          failedSites.push([host, data]);
         }
       });
 
       await Promise.all(promises);
+
+      // 重试逻辑：最多重试2次
+      const maxRetries = 2;
+      for (let retry = 1; retry <= maxRetries && failedSites.length > 0; retry++) {
+        Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
+
+        // 更新进度提示
+        const messageEl = progressToast.querySelector(".ldoh-toast-message");
+        if (messageEl) {
+          messageEl.textContent = `第 ${retry} 次重试 ${failedSites.length} 个失败站点...`;
+        }
+
+        // 重置本轮重试前的失败计数（重新统计）
+        const retrySites = [...failedSites];
+        failedSites.length = 0;
+
+        // 重试失败的站点
+        const retryPromises = retrySites.map(async ([host, data]) => {
+          const success = await checkinSite(host, data, false);
+          if (!success) {
+            failedSites.push([host, data]);
+          }
+        });
+
+        await Promise.all(retryPromises);
+
+        // 更新完成计数
+        completedCount = sites.length - failedSites.length;
+        const progressMessageEl = progressToast.querySelector(".ldoh-toast-message");
+        if (progressMessageEl) {
+          progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+        }
+      }
 
       // 移除进度 toast
       Utils.toast.remove(progressToast);
