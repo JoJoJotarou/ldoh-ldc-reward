@@ -1994,11 +1994,15 @@
 
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
       const today = getTodayDateString();
-      // 筛选需要签到的站点（有 userId 和 token，且今天未签到）
+      const BLACKLIST = [
+        "justdoitme.me", // CF Turnstile 拦截
+        "api.67.si", // CF Turnstile 拦截
+      ]; // 排除自动签到的站点列表
+      // 筛选需要签到的站点（有 userId 和 token，且今天未签到，且不在黑名单中）
       const sites = Object.entries(allData).filter(([host, data]) => {
         if (!data.userId || !data.token || !data.checkinSupported) return false;
         const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
-        return lastCheckinDate !== today;
+        return lastCheckinDate !== today && !BLACKLIST.includes(host);
       });
 
       if (sites.length === 0) {
@@ -2045,7 +2049,9 @@
 
           if (updateProgress) {
             completedCount++;
-            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
             if (messageEl) {
               messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
             }
@@ -2057,7 +2063,8 @@
             siteData.lastCheckinDate = today;
             siteData.checkedInToday = true;
             if (result.data?.quota_awarded) {
-              siteData.quota = (siteData.quota || 0) + result.data.quota_awarded;
+              siteData.quota =
+                (siteData.quota || 0) + result.data.quota_awarded;
             }
             Utils.saveSiteData(host, siteData);
             return true; // 成功
@@ -2080,7 +2087,9 @@
           failCount++;
           if (updateProgress) {
             completedCount++;
-            const messageEl = progressToast.querySelector(".ldoh-toast-message");
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
             if (messageEl) {
               messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
             }
@@ -2101,7 +2110,11 @@
 
       // 重试逻辑：最多重试2次
       const maxRetries = 2;
-      for (let retry = 1; retry <= maxRetries && failedSites.length > 0; retry++) {
+      for (
+        let retry = 1;
+        retry <= maxRetries && failedSites.length > 0;
+        retry++
+      ) {
         Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
 
         // 更新进度提示
@@ -2126,7 +2139,9 @@
 
         // 更新完成计数
         completedCount = sites.length - failedSites.length;
-        const progressMessageEl = progressToast.querySelector(".ldoh-toast-message");
+        const progressMessageEl = progressToast.querySelector(
+          ".ldoh-toast-message",
+        );
         if (progressMessageEl) {
           progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
         }
