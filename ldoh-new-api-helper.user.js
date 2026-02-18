@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.6
+// @version      1.0.7
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,9 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.7 (2026-02-13)
+ * - feat：新增黑名单机制，屏蔽已知非 New API 站点或者 CF 拦截站点
  *
  * v1.0.6 (2026-02-12)
  * - bug：修复签到状态接口返回余额不正确的问题（统一从/api/user/self接口获取余额）
@@ -54,6 +57,12 @@
     STORAGE_KEY: "ldoh_newapi_data",
     SETTINGS_KEY: "ldoh_newapi_settings",
     WHITELIST_KEY: "ldoh_site_whitelist", // LDOH 站点白名单
+    BLACKLIST: [
+      "elysiver.h-e.top", // CF 拦截
+      "demo.voapi.top", // 非 New API 站点
+      "windhub.cc", // 非 New API 站点
+      "ai.qaq.al", // 非 New API 站点
+    ],
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
     MAX_CONCURRENT_REQUESTS: 15, // 最大并发请求数
@@ -427,9 +436,19 @@
           return true;
         }
 
-        // 第一步：检查是否在 LDOH 站点白名单中
-        const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
         const normalizedHost = this.normalizeHost(host);
+
+        // 第一步：检查是否在黑名单中（优先级最高）
+        if (
+          CONFIG.BLACKLIST.length > 0 &&
+          CONFIG.BLACKLIST.includes(normalizedHost)
+        ) {
+          Log.debug(`[站点识别] ${host} - 在黑名单中，跳过`);
+          return false;
+        }
+
+        // 第二步：检查是否在 LDOH 站点白名单中
+        const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
 
         if (!whitelist.includes(normalizedHost)) {
           Log.debug(`[站点识别] ${host} - 不在 LDOH 站点白名单中，跳过`);
@@ -440,7 +459,7 @@
           `[站点识别] ${host} - 在 LDOH 白名单中，继续检测 New API 特征`,
         );
 
-        // 第二步：检查是否符合 New API 站点特征
+        // 第三步：检查是否符合 New API 站点特征
         // 检查 localStorage 中是否有 user 数据（已登录过）
         let hasUserData = !!localStorage.getItem("user");
 
@@ -502,7 +521,11 @@
             try {
               const host = new URL(siteLink.href).hostname;
               const normalizedHost = this.normalizeHost(host);
-              if (normalizedHost) {
+              // 过滤掉黑名单中的站点
+              if (
+                normalizedHost &&
+                !CONFIG.BLACKLIST.includes(normalizedHost)
+              ) {
                 hosts.add(normalizedHost);
               }
             } catch (e) {
