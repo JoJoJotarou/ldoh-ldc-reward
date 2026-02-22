@@ -2032,11 +2032,8 @@
         0,
       );
 
-      // 统计结果
-      let successCount = 0;
-      let failCount = 0;
-      let alreadyCheckedCount = 0;
-      let timeoutCount = 0;
+      // 按站点最终状态统计（key: host, value: 'success'|'already'|'timeout'|'fail'）
+      const siteResults = new Map();
       let completedCount = 0;
 
       // 失败的站点列表（用于重试）
@@ -2058,7 +2055,7 @@
           }
 
           if (result.success) {
-            successCount++;
+            siteResults.set(host, "success");
             const siteData = Utils.getSiteData(host);
             siteData.lastCheckinDate = today;
             siteData.checkedInToday = true;
@@ -2069,22 +2066,22 @@
             Utils.saveSiteData(host, siteData);
             return true; // 成功
           } else if (result.alreadyCheckedIn) {
-            alreadyCheckedCount++;
+            siteResults.set(host, "already");
             const siteData = Utils.getSiteData(host);
             siteData.lastCheckinDate = today;
             siteData.checkedInToday = true;
             Utils.saveSiteData(host, siteData);
             return true; // 成功
           } else if (result.error === "签到超时（15秒）") {
-            timeoutCount++;
+            siteResults.set(host, "timeout");
             return false; // 失败，可重试
           } else {
-            failCount++;
+            siteResults.set(host, "fail");
             return false; // 失败，可重试
           }
         } catch (e) {
           Log.error(`签到站点失败: ${host}`, e);
-          failCount++;
+          siteResults.set(host, "fail");
           if (updateProgress) {
             completedCount++;
             const messageEl = progressToast.querySelector(
@@ -2149,6 +2146,18 @@
 
       // 移除进度 toast
       Utils.toast.remove(progressToast);
+
+      // 从 Map 汇总各站点最终状态
+      let successCount = 0;
+      let alreadyCheckedCount = 0;
+      let timeoutCount = 0;
+      let failCount = 0;
+      for (const status of siteResults.values()) {
+        if (status === "success") successCount++;
+        else if (status === "already") alreadyCheckedCount++;
+        else if (status === "timeout") timeoutCount++;
+        else failCount++;
+      }
 
       // 显示结果
       const resultMessage = `签到完成！\n\n✅ 成功: ${successCount}\n⏭️ 已签到: ${alreadyCheckedCount}\n⏱️ 超时: ${timeoutCount}\n❌ 失败: ${failCount}\n📊 总计: ${sites.length}`;
