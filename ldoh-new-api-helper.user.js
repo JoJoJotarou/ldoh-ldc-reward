@@ -2,7 +2,7 @@
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
 // @version      1.0.13
-// @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
+// @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
 // @include      *
