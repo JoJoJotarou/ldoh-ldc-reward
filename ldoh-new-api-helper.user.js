@@ -1997,12 +1997,15 @@
       const BLACKLIST = [
         "justdoitme.me", // CF Turnstile 拦截
         "api.67.si", // CF Turnstile 拦截
+        "anyrouter.top", // 登录自动签到
       ]; // 排除自动签到的站点列表
       // 筛选需要签到的站点（有 userId 和 token，且今天未签到，且不在黑名单中）
       const sites = Object.entries(allData).filter(([host, data]) => {
         if (!data.userId || !data.token || !data.checkinSupported) return false;
+        if (BLACKLIST.includes(host)) return false;
         const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
-        return lastCheckinDate !== today && !BLACKLIST.includes(host);
+        // lastCheckinDate 不是今天，或 API 明确返回今天未签到（兼容 lastCheckinDate 被错误设置的情况）
+        return lastCheckinDate !== today || data.checkedInToday === false;
       });
 
       if (sites.length === 0) {
