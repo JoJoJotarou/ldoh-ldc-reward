@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.10
+// @version      1.0.11
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,12 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.11 (2026-02-25)
+ * - feat：检测黑名单与签到跳过列表改为可配置，新增 BLACKLIST_KEY / CHECKIN_SKIP_KEY 存储
+ * - feat：悬浮面板每行新增「加入/移出站点黑名单」和「跳过/恢复自动签到」按钮
+ * - feat：设置菜单新增「重置站点黑名单」和「重置签到黑名单」选项
+ *
  * v1.0.10 (2026-02-25)
  * - fix：删除设置更新间隔时 30 分钟以下的二次确认限制，允许任意 ≥ 5 分钟的值
  * - fix：设置更新间隔后不再刷新页面（interval 仅作缓存 TTL，运行时实时读取，无需重载）
@@ -67,6 +73,10 @@
     STORAGE_KEY: "ldoh_newapi_data",
     SETTINGS_KEY: "ldoh_newapi_settings",
     WHITELIST_KEY: "ldoh_site_whitelist", // LDOH 站点白名单
+    BLACKLIST_KEY: "ldoh_site_blacklist", // 用户自定义站点黑名单
+    BLACKLIST_REMOVED_KEY: "ldoh_site_blacklist_removed", // 用户移除的内置站点黑名单
+    CHECKIN_SKIP_KEY: "ldoh_checkin_skip", // 用户自定义签到跳过列表
+    CHECKIN_SKIP_REMOVED_KEY: "ldoh_checkin_skip_removed", // 用户移除的内置签到跳过列表
     BLACKLIST: [
       "elysiver.h-e.top", // CF 拦截
       "demo.voapi.top", // 非 New API 站点
@@ -74,6 +84,11 @@
       "ai.qaq.al", // 非 New API 站点
       "anyrouter.top", // CF 拦截
       "agentrouter.org", // CF 拦截
+    ],
+    DEFAULT_CHECKIN_SKIP: [
+      "justdoitme.me", // CF Turnstile 拦截
+      "api.67.si", // CF Turnstile 拦截
+      "anyrouter.top", // 登录自动签到
     ],
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
@@ -283,7 +298,7 @@
     .ldoh-panel-search-input:focus { border-color: var(--ldoh-primary); background: #fff; }
     .ldoh-panel-body { overflow-y: auto; flex: 1; scrollbar-width: thin; }
     .ldoh-panel-row {
-      display: grid; grid-template-columns: 1fr 54px 64px 22px 22px 22px 22px;
+      display: grid; grid-template-columns: 1fr 54px 64px 22px 22px 22px 22px 22px 22px;
       align-items: center; gap: 6px; padding: 7px 12px;
       border-bottom: 1px solid #f1f5f9; transition: background 0.15s; font-size: 12px;
     }
@@ -491,6 +506,128 @@
     },
 
     /**
+     * 获取用户自定义站点黑名单
+     */
+    getBlacklist() {
+      return GM_getValue(CONFIG.BLACKLIST_KEY, []);
+    },
+
+    /**
+     * 判断站点是否在黑名单中
+     * 有效黑名单 = (内置 ∪ 用户追加) \ 用户移除
+     */
+    isBlacklisted(host) {
+      const n = this.normalizeHost(host);
+      const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
+      const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
+      return (
+        (CONFIG.BLACKLIST.includes(n) && !removed.includes(n)) ||
+        added.includes(n)
+      );
+    },
+
+    /**
+     * 切换站点在黑名单中的状态（内置条目同样可被移除）
+     * @returns {boolean} true=已加入黑名单，false=已移出
+     */
+    toggleBlacklist(host) {
+      const n = this.normalizeHost(host);
+      if (this.isBlacklisted(n)) {
+        // 移出：内置 → 加入 removed 列表；用户追加 → 从 added 列表移除
+        if (CONFIG.BLACKLIST.includes(n)) {
+          const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
+          if (!removed.includes(n)) {
+            removed.push(n);
+            GM_setValue(CONFIG.BLACKLIST_REMOVED_KEY, removed);
+          }
+        } else {
+          const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
+          const idx = added.indexOf(n);
+          if (idx >= 0) {
+            added.splice(idx, 1);
+            GM_setValue(CONFIG.BLACKLIST_KEY, added);
+          }
+        }
+        return false;
+      } else {
+        // 加入：若曾被用户移除过内置条目 → 从 removed 列表删除；否则加入 added 列表
+        const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
+        const ridx = removed.indexOf(n);
+        if (ridx >= 0) {
+          removed.splice(ridx, 1);
+          GM_setValue(CONFIG.BLACKLIST_REMOVED_KEY, removed);
+        } else {
+          const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
+          if (!added.includes(n)) {
+            added.push(n);
+            GM_setValue(CONFIG.BLACKLIST_KEY, added);
+          }
+        }
+        return true;
+      }
+    },
+
+    /**
+     * 获取用户自定义签到跳过列表
+     */
+    getCheckinSkip() {
+      return GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
+    },
+
+    /**
+     * 判断站点是否跳过自动签到
+     * 有效列表 = (内置 ∪ 用户追加) \ 用户移除
+     */
+    isCheckinSkipped(host) {
+      const n = this.normalizeHost(host);
+      const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
+      const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
+      return (
+        (CONFIG.DEFAULT_CHECKIN_SKIP.includes(n) && !removed.includes(n)) ||
+        added.includes(n)
+      );
+    },
+
+    /**
+     * 切换站点在签到跳过列表中的状态（内置条目同样可被移除）
+     * @returns {boolean} true=已加入跳过列表，false=已移出
+     */
+    toggleCheckinSkip(host) {
+      const n = this.normalizeHost(host);
+      if (this.isCheckinSkipped(n)) {
+        if (CONFIG.DEFAULT_CHECKIN_SKIP.includes(n)) {
+          const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
+          if (!removed.includes(n)) {
+            removed.push(n);
+            GM_setValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, removed);
+          }
+        } else {
+          const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
+          const idx = added.indexOf(n);
+          if (idx >= 0) {
+            added.splice(idx, 1);
+            GM_setValue(CONFIG.CHECKIN_SKIP_KEY, added);
+          }
+        }
+        return false;
+      } else {
+        const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
+        const ridx = removed.indexOf(n);
+        if (ridx >= 0) {
+          removed.splice(ridx, 1);
+          GM_setValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, removed);
+        } else {
+          const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
+          if (!added.includes(n)) {
+            added.push(n);
+            GM_setValue(CONFIG.CHECKIN_SKIP_KEY, added);
+          }
+        }
+        return true;
+      }
+    },
+
+    /**
      * 复制文本到剪贴板
      * @param {string} text - 要复制的文本
      */
@@ -597,10 +734,7 @@
         const normalizedHost = this.normalizeHost(host);
 
         // 第一步：检查是否在黑名单中（优先级最高）
-        if (
-          CONFIG.BLACKLIST.length > 0 &&
-          CONFIG.BLACKLIST.includes(normalizedHost)
-        ) {
+        if (Utils.isBlacklisted(normalizedHost)) {
           Log.debug(`[站点识别] ${host} - 在黑名单中，跳过`);
           return false;
         }
@@ -680,10 +814,7 @@
               const host = new URL(siteLink.href).hostname;
               const normalizedHost = this.normalizeHost(host);
               // 过滤掉黑名单中的站点
-              if (
-                normalizedHost &&
-                !CONFIG.BLACKLIST.includes(normalizedHost)
-              ) {
+              if (normalizedHost && !Utils.isBlacklisted(normalizedHost)) {
                 hosts.add(normalizedHost);
               }
             } catch (e) {
@@ -2061,6 +2192,28 @@
           label: "设置更新间隔",
           handler: (triggerEl) => this._showIntervalPopover(triggerEl),
         },
+        {
+          label: "重置检测黑名单",
+          handler: (triggerEl) => {
+            this._showConfirmPopover(triggerEl, "确认重置检测黑名单？", () => {
+              GM_setValue(CONFIG.BLACKLIST_KEY, []);
+              GM_setValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
+              Utils.toast.success("检测黑名单已重置");
+              FloatingPanel.refresh();
+            });
+          },
+        },
+        {
+          label: "重置签到黑名单",
+          handler: (triggerEl) => {
+            this._showConfirmPopover(triggerEl, "确认重置签到黑名单？", () => {
+              GM_setValue(CONFIG.CHECKIN_SKIP_KEY, []);
+              GM_setValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
+              Utils.toast.success("签到黑名单已重置");
+              FloatingPanel.refresh();
+            });
+          },
+        },
       ];
 
       const pop = document.createElement("div");
@@ -2405,6 +2558,58 @@
           row.appendChild(refreshBtn);
           row.appendChild(locateBtn);
 
+          // 站点黑名单按钮（eye 图标：绿=检测中，灰=已屏蔽）
+          const isBlacklisted = Utils.isBlacklisted(host);
+          const blacklistBtn = document.createElement("div");
+          blacklistBtn.className = "ldoh-btn";
+          blacklistBtn.title = isBlacklisted
+            ? "已屏蔽（点击恢复检测）"
+            : "检测中（点击加入黑名单）";
+          blacklistBtn.style.color = isBlacklisted
+            ? "#9ca3af"
+            : "var(--ldoh-success)";
+          blacklistBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+          blacklistBtn.onclick = (e) => {
+            e.stopPropagation();
+            const confirmText = isBlacklisted
+              ? `移出黑名单并恢复检测？`
+              : `加入黑名单并停止检测？`;
+            this._showConfirmPopover(blacklistBtn, confirmText, () => {
+              const added = Utils.toggleBlacklist(host);
+              Utils.toast.success(
+                added ? `${host} 已加入黑名单` : `${host} 已移出黑名单`,
+              );
+              FloatingPanel.refresh();
+            });
+          };
+          row.appendChild(blacklistBtn);
+
+          // 跳过签到按钮（calendar 图标：绿=参与签到，灰=跳过签到）
+          const isSkipped = Utils.isCheckinSkipped(host);
+          const skipCheckinBtn = document.createElement("div");
+          skipCheckinBtn.className = "ldoh-btn";
+          skipCheckinBtn.title = isSkipped
+            ? "已跳过签到（点击恢复）"
+            : "参与签到（点击跳过）";
+          skipCheckinBtn.style.color = isSkipped
+            ? "#9ca3af"
+            : "var(--ldoh-success)";
+          skipCheckinBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><polyline points="9 16 11 18 15 14"/></svg>`;
+          skipCheckinBtn.onclick = (e) => {
+            e.stopPropagation();
+            const confirmText = isSkipped
+              ? `恢复 ${host} 自动签到？`
+              : `跳过 ${host} 自动签到？`;
+            this._showConfirmPopover(skipCheckinBtn, confirmText, () => {
+              const added = Utils.toggleCheckinSkip(host);
+              Utils.toast.success(
+                added ? `${host} 已跳过自动签到` : `${host} 已恢复自动签到`,
+              );
+              FloatingPanel.refresh();
+            });
+          };
+          row.appendChild(skipCheckinBtn);
+
           // 删除按钮
           const deleteBtn = document.createElement("div");
           deleteBtn.className = "ldoh-btn";
@@ -2696,7 +2901,7 @@
 
     // 只刷新有 userId 且不在黑名单中的站点
     const sites = Object.entries(allData).filter(
-      ([host, data]) => data.userId && !CONFIG.BLACKLIST.includes(host),
+      ([host, data]) => data.userId && !Utils.isBlacklisted(host),
     );
     const siteCount = sites.length;
 
@@ -2760,14 +2965,9 @@
   async function runAutoCheckin(showConfirm = true) {
     const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
     const today = getTodayDateString();
-    const CHECKIN_BLACKLIST = [
-      "justdoitme.me", // CF Turnstile 拦截
-      "api.67.si", // CF Turnstile 拦截
-      "anyrouter.top", // 登录自动签到
-    ];
     const sites = Object.entries(allData).filter(([host, data]) => {
       if (!data.userId || !data.token || !data.checkinSupported) return false;
-      if (CHECKIN_BLACKLIST.includes(host)) return false;
+      if (Utils.isCheckinSkipped(host)) return false;
       const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
       return lastCheckinDate !== today || data.checkedInToday === false;
     });
@@ -2859,7 +3059,11 @@
     await Promise.all(promises);
 
     const maxRetries = 2;
-    for (let retry = 1; retry <= maxRetries && failedSites.length > 0; retry++) {
+    for (
+      let retry = 1;
+      retry <= maxRetries && failedSites.length > 0;
+      retry++
+    ) {
       Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
       const messageEl = progressToast.querySelector(".ldoh-toast-message");
       if (messageEl) {
@@ -2873,7 +3077,9 @@
       });
       await Promise.all(retryPromises);
       completedCount = sites.length - failedSites.length;
-      const progressMessageEl = progressToast.querySelector(".ldoh-toast-message");
+      const progressMessageEl = progressToast.querySelector(
+        ".ldoh-toast-message",
+      );
       if (progressMessageEl) {
         progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
       }
@@ -2881,7 +3087,10 @@
 
     Utils.toast.remove(progressToast);
 
-    let successCount = 0, alreadyCheckedCount = 0, timeoutCount = 0, failCount = 0;
+    let successCount = 0,
+      alreadyCheckedCount = 0,
+      timeoutCount = 0,
+      failCount = 0;
     for (const status of siteResults.values()) {
       if (status === "success") successCount++;
       else if (status === "already") alreadyCheckedCount++;
