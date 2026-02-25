@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.8
+// @version      1.0.9
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,8 @@
 
 /**
  * 版本更新日志
+ * v1.0.9 (2026-02-25)
+ * - feat：新增自动签到功能
  *
  * v1.0.8 (2026-02-25)
  * - feat：新增右下角悬浮面板，仅在 LDOH 主站显示，按余额排序展示所有站点（签到、余额、密钥、刷新、定位）
@@ -1749,7 +1751,12 @@
     const h3Link = card.querySelector("h3 a");
     if (h3Link) {
       const text = h3Link.textContent.trim();
-      if (text && text.length >= 2 && text.length <= 40 && !text.includes("http")) {
+      if (
+        text &&
+        text.length >= 2 &&
+        text.length <= 40 &&
+        !text.includes("http")
+      ) {
         return text;
       }
     }
@@ -1757,7 +1764,12 @@
     const h3 = card.querySelector("h3");
     if (h3) {
       const text = h3.textContent.trim();
-      if (text && text.length >= 2 && text.length <= 40 && !text.includes("http")) {
+      if (
+        text &&
+        text.length >= 2 &&
+        text.length <= 40 &&
+        !text.includes("http")
+      ) {
         return text;
       }
     }
@@ -1775,11 +1787,15 @@
     for (const card of cards) {
       const links = Array.from(card.querySelectorAll("a"));
       const siteLink =
-        links.find((a) => a.href.startsWith("http") && !a.href.includes("linux.do")) ||
-        links[0];
+        links.find(
+          (a) => a.href.startsWith("http") && !a.href.includes("linux.do"),
+        ) || links[0];
       if (!siteLink) continue;
       try {
-        if (Utils.normalizeHost(new URL(siteLink.href).hostname) === normalizedHost)
+        if (
+          Utils.normalizeHost(new URL(siteLink.href).hostname) ===
+          normalizedHost
+        )
           return card;
       } catch (e) {}
     }
@@ -1794,6 +1810,10 @@
     _panel: null,
     _isOpen: false,
     _searchQuery: "",
+    _checkinRunning: false,
+    _refreshAllRunning: false,
+    _confirmPop: null,
+    _confirmOutsideHandler: null,
 
     init() {
       if (document.getElementById("ldoh-fab")) return;
@@ -1811,7 +1831,10 @@
         </svg>
         <span class="ldoh-fab-badge" id="ldoh-fab-badge" style="display:none">0</span>
       `;
-      fab.onclick = (e) => { e.stopPropagation(); this.toggle(); };
+      fab.onclick = (e) => {
+        e.stopPropagation();
+        this.toggle();
+      };
       document.body.appendChild(fab);
       this._fab = fab;
 
@@ -1825,7 +1848,11 @@
 
       // 点击面板外部关闭
       document.addEventListener("click", (e) => {
-        if (this._isOpen && !panel.contains(e.target) && !fab.contains(e.target)) {
+        if (
+          this._isOpen &&
+          !panel.contains(e.target) &&
+          !fab.contains(e.target)
+        ) {
           this.close();
         }
       });
@@ -1849,6 +1876,7 @@
     close() {
       this._isOpen = false;
       this._searchQuery = "";
+      this._removeConfirmPopover();
       this._panel.style.display = "none";
     },
 
@@ -1867,8 +1895,72 @@
       }
     },
 
+    _removeConfirmPopover() {
+      if (this._confirmOutsideHandler) {
+        document.removeEventListener("click", this._confirmOutsideHandler);
+        this._confirmOutsideHandler = null;
+      }
+      if (this._confirmPop) {
+        this._confirmPop.remove();
+        this._confirmPop = null;
+      } else {
+        document.getElementById("ldoh-confirm-pop")?.remove();
+      }
+    },
+
+    _showConfirmPopover(anchorEl, text, onConfirm) {
+      if (!anchorEl) return;
+      this._removeConfirmPopover();
+
+      const pop = document.createElement("div");
+      pop.id = "ldoh-confirm-pop";
+      pop.className = "ldoh-confirm-pop";
+      pop.innerHTML = `
+        <span>${Utils.escapeHtml(text)}</span>
+        <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
+        <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
+      `;
+
+      const rect = anchorEl.getBoundingClientRect();
+      pop.style.top = `${rect.top - 48}px`;
+      pop.style.right = `${window.innerWidth - rect.right}px`;
+      document.body.appendChild(pop);
+      this._confirmPop = pop;
+
+      pop.querySelector(".ldoh-pop-cancel").onclick = (e) => {
+        e.stopPropagation();
+        this._removeConfirmPopover();
+      };
+
+      pop.querySelector(".ldoh-pop-confirm").onclick = (e) => {
+        e.stopPropagation();
+        this._removeConfirmPopover();
+        try {
+          const maybePromise = onConfirm?.();
+          if (maybePromise && typeof maybePromise.then === "function") {
+            maybePromise.catch((err) => {
+              Log.error("[确认操作执行失败]", err);
+            });
+          }
+        } catch (err) {
+          Log.error("[确认操作执行失败]", err);
+        }
+      };
+
+      this._confirmOutsideHandler = (e) => {
+        if (!pop.contains(e.target) && !anchorEl.contains(e.target)) {
+          this._removeConfirmPopover();
+        }
+      };
+      setTimeout(
+        () => document.addEventListener("click", this._confirmOutsideHandler),
+        0,
+      );
+    },
+
     render() {
       if (!this._panel) return;
+      this._removeConfirmPopover();
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
       // 按余额从大到小排序，过滤无 userId 站点
@@ -1876,7 +1968,10 @@
         .filter(([, d]) => d.userId)
         .sort(([, a], [, b]) => (b.quota || 0) - (a.quota || 0));
 
-      const totalBalance = sorted.reduce((sum, [, d]) => sum + (d.quota || 0), 0);
+      const totalBalance = sorted.reduce(
+        (sum, [, d]) => sum + (d.quota || 0),
+        0,
+      );
 
       this._panel.innerHTML = "";
 
@@ -1899,6 +1994,59 @@
       closeBtn.style.flexShrink = "0";
       closeBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
       closeBtn.onclick = () => this.close();
+
+      // 刷新全部按钮
+      const refreshAllBtn = document.createElement("div");
+      refreshAllBtn.className = "ldoh-btn ldoh-refresh-btn";
+      refreshAllBtn.title = "刷新所有站点数据";
+      refreshAllBtn.style.flexShrink = "0";
+      refreshAllBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>`;
+      if (this._refreshAllRunning) {
+        refreshAllBtn.classList.add("loading");
+      }
+      refreshAllBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (this._refreshAllRunning) return;
+        this._showConfirmPopover(refreshAllBtn, "确认刷新全部？", async () => {
+          if (this._refreshAllRunning) return;
+          this._refreshAllRunning = true;
+          refreshAllBtn.classList.add("loading");
+          try {
+            await runRefreshAll();
+          } finally {
+            this._refreshAllRunning = false;
+            FloatingPanel.refresh();
+          }
+        });
+      };
+
+      // 签到按钮
+      const checkinBtn = document.createElement("div");
+      checkinBtn.className = "ldoh-btn ldoh-refresh-btn";
+      checkinBtn.title = "一键签到所有未签到站点";
+      checkinBtn.style.flexShrink = "0";
+      checkinBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><polyline points="9 16 11 18 15 14"/></svg>`;
+      if (this._checkinRunning) {
+        checkinBtn.classList.add("loading");
+      }
+      checkinBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (this._checkinRunning) return;
+        this._showConfirmPopover(checkinBtn, "确认自动签到？", async () => {
+          if (this._checkinRunning) return;
+          this._checkinRunning = true;
+          checkinBtn.classList.add("loading");
+          try {
+            await runAutoCheckin(false);
+          } finally {
+            this._checkinRunning = false;
+            FloatingPanel.refresh();
+          }
+        });
+      };
+
+      hd.appendChild(refreshAllBtn);
+      hd.appendChild(checkinBtn);
       hd.appendChild(closeBtn);
       this._panel.appendChild(hd);
 
@@ -1928,18 +2076,24 @@
           row.className = "ldoh-panel-row";
 
           // 签到状态
-          let checkinClass = "na", checkinText = "─";
+          let checkinClass = "na",
+            checkinText = "─";
           if (siteData.checkinSupported !== false) {
             if (siteData.checkedInToday === true) {
-              checkinClass = "ok"; checkinText = "已签到";
+              checkinClass = "ok";
+              checkinText = "已签到";
             } else if (siteData.checkedInToday === false) {
-              checkinClass = "no"; checkinText = "未签到";
+              checkinClass = "no";
+              checkinText = "未签到";
             }
           }
 
           const displayName = siteData.siteName || host;
           row.dataset.searchKey = `${displayName} ${host}`.toLowerCase();
-          if (this._searchQuery && !row.dataset.searchKey.includes(this._searchQuery)) {
+          if (
+            this._searchQuery &&
+            !row.dataset.searchKey.includes(this._searchQuery)
+          ) {
             row.style.display = "none";
           }
 
@@ -1965,7 +2119,10 @@
           keyBtn.className = "ldoh-btn";
           keyBtn.title = "密钥与模型";
           keyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`;
-          keyBtn.onclick = (e) => { e.stopPropagation(); showDetailsDialog(host, siteData); };
+          keyBtn.onclick = (e) => {
+            e.stopPropagation();
+            showDetailsDialog(host, siteData);
+          };
 
           // 刷新按钮
           const refreshBtn = document.createElement("div");
@@ -1977,7 +2134,11 @@
             if (refreshBtn.classList.contains("loading")) return;
             try {
               refreshBtn.classList.add("loading");
-              const fresh = await API.updateSiteStatus(host, siteData.userId, true);
+              const fresh = await API.updateSiteStatus(
+                host,
+                siteData.userId,
+                true,
+              );
               const card = findCardByHost(host);
               if (card) renderHelper(card, host, fresh);
               FloatingPanel.refresh();
@@ -2002,7 +2163,10 @@
               card.scrollIntoView({ behavior: "smooth", block: "center" });
               card.style.outline = "2px solid var(--ldoh-primary)";
               card.style.outlineOffset = "2px";
-              setTimeout(() => { card.style.outline = ""; card.style.outlineOffset = ""; }, 2000);
+              setTimeout(() => {
+                card.style.outline = "";
+                card.style.outlineOffset = "";
+              }, 2000);
             } else {
               Utils.toast.warning(`未找到 ${host} 的卡片`);
             }
@@ -2018,57 +2182,26 @@
           deleteBtn.title = "删除缓存数据";
           deleteBtn.style.color = "var(--ldoh-danger)";
           deleteBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
-          deleteBtn.onmouseenter = () => (deleteBtn.style.background = "rgba(239, 68, 68, 0.1)");
-          deleteBtn.onmouseleave = () => (deleteBtn.style.background = "transparent");
+          deleteBtn.onmouseenter = () =>
+            (deleteBtn.style.background = "rgba(239, 68, 68, 0.1)");
+          deleteBtn.onmouseleave = () =>
+            (deleteBtn.style.background = "transparent");
           deleteBtn.onclick = (e) => {
             e.stopPropagation();
-
-            // 关闭已有气泡
-            document.getElementById("ldoh-confirm-pop")?.remove();
-
-            const pop = document.createElement("div");
-            pop.id = "ldoh-confirm-pop";
-            pop.className = "ldoh-confirm-pop";
-            pop.innerHTML = `
-              <span>确认删除？</span>
-              <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
-              <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
-            `;
-
-            // 定位到删除按钮上方，右对齐
-            const rect = deleteBtn.getBoundingClientRect();
-            pop.style.top = `${rect.top - 48}px`;
-            pop.style.right = `${window.innerWidth - rect.right}px`;
-            document.body.appendChild(pop);
-
-            pop.querySelector(".ldoh-pop-cancel").onclick = (e2) => {
-              e2.stopPropagation();
-              pop.remove();
-            };
-
-            pop.querySelector(".ldoh-pop-confirm").onclick = (e2) => {
-              e2.stopPropagation();
-              pop.remove();
+            this._showConfirmPopover(deleteBtn, "确认删除？", () => {
               const all = GM_getValue(CONFIG.STORAGE_KEY, {});
               delete all[Utils.normalizeHost(host)];
               GM_setValue(CONFIG.STORAGE_KEY, all);
               const card = findCardByHost(host);
               if (card) {
-                const container = card.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`);
+                const container = card.querySelector(
+                  `.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`,
+                );
                 if (container) container.remove();
               }
               FloatingPanel.refresh();
               Utils.toast.success(`已删除 ${host} 的缓存数据`);
-            };
-
-            // 点击外部关闭
-            const onOutside = (e2) => {
-              if (!pop.contains(e2.target) && e2.target !== deleteBtn) {
-                pop.remove();
-                document.removeEventListener("click", onOutside);
-              }
-            };
-            setTimeout(() => document.addEventListener("click", onOutside), 0);
+            });
           };
           row.appendChild(deleteBtn);
 
@@ -2085,7 +2218,9 @@
         searchDebounceTimer = setTimeout(() => {
           this._searchQuery = searchInput.value.toLowerCase().trim();
           body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
-            const match = !this._searchQuery || row.dataset.searchKey.includes(this._searchQuery);
+            const match =
+              !this._searchQuery ||
+              row.dataset.searchKey.includes(this._searchQuery);
             row.style.display = match ? "" : "none";
           });
         }, 200);
@@ -2361,86 +2496,54 @@
     }
   });
 
-  GM_registerMenuCommand("🔄 手动刷新所有站点", async () => {
-    try {
-      const isPortal = window.location.hostname === "ldoh.105117.xyz";
-      if (!isPortal) {
-        Utils.toast.warning("此功能仅在 LDOH 页面可用");
-        return;
-      }
+  /**
+   * 刷新所有站点数据
+   */
+  async function runRefreshAll() {
+    const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
-      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-      const siteCount = Object.keys(allData).length;
+    // 只刷新有 userId 且不在黑名单中的站点
+    const sites = Object.entries(allData).filter(
+      ([host, data]) => data.userId && !CONFIG.BLACKLIST.includes(host),
+    );
+    const siteCount = sites.length;
 
-      if (siteCount === 0) {
-        Utils.toast.info("没有站点数据需要刷新");
-        return;
-      }
-
-      const confirm = window.confirm(
-        `🔄 将刷新 ${siteCount} 个站点的数据\n这可能需要一些时间，是否继续？`,
-      );
-      if (!confirm) return;
-
-      Log.info(`开始手动刷新 ${siteCount} 个站点`);
-
-      // 创建持久的进度 toast（duration 为 0 表示不自动消失）
-      const progressToast = Utils.toast.show(
-        `正在刷新站点 0/${siteCount}...`,
-        "info",
-        0,
-      );
-
-      // 跟踪完成数量
-      let completedCount = 0;
-
-      // 等待所有站点刷新完成
-      const hosts = Object.keys(allData);
-      const promises = hosts.map(async (host) => {
-        const data = allData[host];
-        if (data.userId) {
-          try {
-            await API.updateSiteStatus(host, data.userId, true);
-            completedCount++;
-            // 更新进度
-            const messageEl = progressToast.querySelector(
-              ".ldoh-toast-message",
-            );
-            if (messageEl) {
-              messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
-            }
-          } catch (e) {
-            Log.error(`刷新站点失败: ${host}`, e);
-            completedCount++;
-            // 即使失败也更新进度
-            const messageEl = progressToast.querySelector(
-              ".ldoh-toast-message",
-            );
-            if (messageEl) {
-              messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
-            }
-          }
-        } else {
-          completedCount++;
-          const messageEl = progressToast.querySelector(".ldoh-toast-message");
-          if (messageEl) {
-            messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
-          }
-        }
-      });
-
-      await Promise.all(promises);
-
-      // 移除进度 toast
-      Utils.toast.remove(progressToast);
-
-      Utils.toast.success(`已完成刷新 ${siteCount} 个站点，页面即将刷新`, 800);
-      setTimeout(() => location.reload(), 800);
-    } catch (e) {
-      Log.error("手动刷新失败", e);
-      Utils.toast.error("刷新失败，请查看控制台");
+    if (siteCount === 0) {
+      Utils.toast.info("没有站点数据需要刷新");
+      return;
     }
-  });
+
+    Log.info(`开始刷新 ${siteCount} 个站点`);
+
+    const progressToast = Utils.toast.show(
+      `正在刷新站点 0/${siteCount}...`,
+      "info",
+      0,
+    );
+
+    let completedCount = 0;
+
+    const promises = sites.map(async ([host, data]) => {
+      try {
+        const fresh = await API.updateSiteStatus(host, data.userId, true);
+        const card = findCardByHost(host);
+        if (card) renderHelper(card, host, fresh);
+      } catch (e) {
+        Log.error(`刷新站点失败: ${host}`, e);
+      }
+      completedCount++;
+      const messageEl = progressToast.querySelector(".ldoh-toast-message");
+      if (messageEl) {
+        messageEl.textContent = `正在刷新站点 ${completedCount}/${siteCount}...`;
+      }
+    });
+
+    await Promise.all(promises);
+
+    Utils.toast.remove(progressToast);
+    Utils.toast.success(`已刷新 ${siteCount} 个站点`, 3000);
+    FloatingPanel.refresh();
+  }
 
   // ==================== 自动签到功能 ====================
   // 注意：此功能需要配合数据结构修改
@@ -2458,205 +2561,154 @@
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   }
 
-  GM_registerMenuCommand("🎁 自动签到所有站点", async () => {
-    try {
-      const isPortal = window.location.hostname === "ldoh.105117.xyz";
-      if (!isPortal) {
-        Utils.toast.warning("此功能仅在 LDOH 页面可用");
-        return;
-      }
+  /**
+   * 自动签到所有未签到站点
+   * @param {boolean} showConfirm - 是否显示确认对话框（菜单命令传 true，面板按钮传 false）
+   */
+  async function runAutoCheckin(showConfirm = true) {
+    const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+    const today = getTodayDateString();
+    const CHECKIN_BLACKLIST = [
+      "justdoitme.me", // CF Turnstile 拦截
+      "api.67.si", // CF Turnstile 拦截
+      "anyrouter.top", // 登录自动签到
+    ];
+    const sites = Object.entries(allData).filter(([host, data]) => {
+      if (!data.userId || !data.token || !data.checkinSupported) return false;
+      if (CHECKIN_BLACKLIST.includes(host)) return false;
+      const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
+      return lastCheckinDate !== today || data.checkedInToday === false;
+    });
 
-      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-      const today = getTodayDateString();
-      const BLACKLIST = [
-        "justdoitme.me", // CF Turnstile 拦截
-        "api.67.si", // CF Turnstile 拦截
-        "anyrouter.top", // 登录自动签到
-      ]; // 排除自动签到的站点列表
-      // 筛选需要签到的站点（有 userId 和 token，且今天未签到，且不在黑名单中）
-      const sites = Object.entries(allData).filter(([host, data]) => {
-        if (!data.userId || !data.token || !data.checkinSupported) return false;
-        if (BLACKLIST.includes(host)) return false;
-        const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
-        // lastCheckinDate 不是今天，或 API 明确返回今天未签到（兼容 lastCheckinDate 被错误设置的情况）
-        return lastCheckinDate !== today || data.checkedInToday === false;
-      });
+    if (sites.length === 0) {
+      Utils.toast.info("所有站点今天都已签到");
+      return;
+    }
 
-      if (sites.length === 0) {
-        Utils.toast.info("所有站点今天都已签到");
-        return;
-      }
-
-      // 构建站点列表信息
+    if (showConfirm) {
       const siteList = sites
         .map(([host, data]) => {
           const lastCheckin = data.lastCheckinDate || "从未";
           return `  • ${host} (上次: ${lastCheckin})`;
         })
         .join("\n");
-
-      const confirm = window.confirm(
+      const confirmed = window.confirm(
         `🎁 将对以下 ${sites.length} 个站点进行自动签到：\n\n${siteList}\n\n注意：部分站点可能有 CF 校验，签到可能失败或超时（10秒）\n\n是否继续？`,
       );
-      if (!confirm) return;
-
-      Log.info(`开始自动签到 ${sites.length} 个站点`);
-
-      // 创建持久的进度 toast
-      const progressToast = Utils.toast.show(
-        `正在签到 0/${sites.length}...`,
-        "info",
-        0,
-      );
-
-      // 按站点最终状态统计（key: host, value: 'success'|'already'|'timeout'|'fail'）
-      const siteResults = new Map();
-      let completedCount = 0;
-
-      // 失败的站点列表（用于重试）
-      const failedSites = [];
-
-      // 签到单个站点的函数
-      const checkinSite = async (host, data, updateProgress = true) => {
-        try {
-          const result = await API.checkin(host, data.token, data.userId);
-
-          if (updateProgress) {
-            completedCount++;
-            const messageEl = progressToast.querySelector(
-              ".ldoh-toast-message",
-            );
-            if (messageEl) {
-              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
-            }
-          }
-
-          if (result.success) {
-            siteResults.set(host, "success");
-            const siteData = Utils.getSiteData(host);
-            siteData.lastCheckinDate = today;
-            siteData.checkedInToday = true;
-            if (result.data?.quota_awarded) {
-              siteData.quota =
-                (siteData.quota || 0) + result.data.quota_awarded;
-            }
-            Utils.saveSiteData(host, siteData);
-            return true; // 成功
-          } else if (result.alreadyCheckedIn) {
-            siteResults.set(host, "already");
-            const siteData = Utils.getSiteData(host);
-            siteData.lastCheckinDate = today;
-            siteData.checkedInToday = true;
-            Utils.saveSiteData(host, siteData);
-            return true; // 成功
-          } else if (result.error === "签到超时（15秒）") {
-            siteResults.set(host, "timeout");
-            return false; // 失败，可重试
-          } else {
-            siteResults.set(host, "fail");
-            return false; // 失败，可重试
-          }
-        } catch (e) {
-          Log.error(`签到站点失败: ${host}`, e);
-          siteResults.set(host, "fail");
-          if (updateProgress) {
-            completedCount++;
-            const messageEl = progressToast.querySelector(
-              ".ldoh-toast-message",
-            );
-            if (messageEl) {
-              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
-            }
-          }
-          return false; // 失败，可重试
-        }
-      };
-
-      // 第一轮签到所有站点
-      const promises = sites.map(async ([host, data]) => {
-        const success = await checkinSite(host, data);
-        if (!success) {
-          failedSites.push([host, data]);
-        }
-      });
-
-      await Promise.all(promises);
-
-      // 重试逻辑：最多重试2次
-      const maxRetries = 2;
-      for (
-        let retry = 1;
-        retry <= maxRetries && failedSites.length > 0;
-        retry++
-      ) {
-        Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
-
-        // 更新进度提示
-        const messageEl = progressToast.querySelector(".ldoh-toast-message");
-        if (messageEl) {
-          messageEl.textContent = `第 ${retry} 次重试 ${failedSites.length} 个失败站点...`;
-        }
-
-        // 重置本轮重试前的失败计数（重新统计）
-        const retrySites = [...failedSites];
-        failedSites.length = 0;
-
-        // 重试失败的站点
-        const retryPromises = retrySites.map(async ([host, data]) => {
-          const success = await checkinSite(host, data, false);
-          if (!success) {
-            failedSites.push([host, data]);
-          }
-        });
-
-        await Promise.all(retryPromises);
-
-        // 更新完成计数
-        completedCount = sites.length - failedSites.length;
-        const progressMessageEl = progressToast.querySelector(
-          ".ldoh-toast-message",
-        );
-        if (progressMessageEl) {
-          progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
-        }
-      }
-
-      // 移除进度 toast
-      Utils.toast.remove(progressToast);
-
-      // 从 Map 汇总各站点最终状态
-      let successCount = 0;
-      let alreadyCheckedCount = 0;
-      let timeoutCount = 0;
-      let failCount = 0;
-      for (const status of siteResults.values()) {
-        if (status === "success") successCount++;
-        else if (status === "already") alreadyCheckedCount++;
-        else if (status === "timeout") timeoutCount++;
-        else failCount++;
-      }
-
-      // 显示结果
-      const resultMessage = `签到完成！\n\n✅ 成功: ${successCount}\n⏭️ 已签到: ${alreadyCheckedCount}\n⏱️ 超时: ${timeoutCount}\n❌ 失败: ${failCount}\n📊 总计: ${sites.length}`;
-
-      Log.success(resultMessage.replace(/\n/g, " "));
-
-      if (successCount > 0 || alreadyCheckedCount > 0) {
-        Utils.toast.success(
-          `签到完成！成功 ${successCount} 个，已签到 ${alreadyCheckedCount} 个`,
-          5000,
-        );
-      } else {
-        Utils.toast.warning(`签到完成，但没有成功的站点`, 5000);
-      }
-
-      // 刷新页面以更新显示
-      //   setTimeout(() => location.reload(), 2000);
-    } catch (e) {
-      Log.error("自动签到失败", e);
-      Utils.toast.error("自动签到失败，请查看控制台");
+      if (!confirmed) return;
     }
-  });
+
+    Log.info(`开始自动签到 ${sites.length} 个站点`);
+
+    const progressToast = Utils.toast.show(
+      `正在签到 0/${sites.length}...`,
+      "info",
+      0,
+    );
+
+    const siteResults = new Map();
+    let completedCount = 0;
+    const failedSites = [];
+
+    const checkinSite = async (host, data, updateProgress = true) => {
+      try {
+        const result = await API.checkin(host, data.token, data.userId);
+
+        if (updateProgress) {
+          completedCount++;
+          const messageEl = progressToast.querySelector(".ldoh-toast-message");
+          if (messageEl) {
+            messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+          }
+        }
+
+        if (result.success) {
+          siteResults.set(host, "success");
+          const siteData = Utils.getSiteData(host);
+          siteData.lastCheckinDate = today;
+          siteData.checkedInToday = true;
+          if (result.data?.quota_awarded) {
+            siteData.quota = (siteData.quota || 0) + result.data.quota_awarded;
+          }
+          Utils.saveSiteData(host, siteData);
+          return true;
+        } else if (result.alreadyCheckedIn) {
+          siteResults.set(host, "already");
+          const siteData = Utils.getSiteData(host);
+          siteData.lastCheckinDate = today;
+          siteData.checkedInToday = true;
+          Utils.saveSiteData(host, siteData);
+          return true;
+        } else if (result.error === "签到超时（15秒）") {
+          siteResults.set(host, "timeout");
+          return false;
+        } else {
+          siteResults.set(host, "fail");
+          return false;
+        }
+      } catch (e) {
+        Log.error(`签到站点失败: ${host}`, e);
+        siteResults.set(host, "fail");
+        if (updateProgress) {
+          completedCount++;
+          const messageEl = progressToast.querySelector(".ldoh-toast-message");
+          if (messageEl) {
+            messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+          }
+        }
+        return false;
+      }
+    };
+
+    const promises = sites.map(async ([host, data]) => {
+      const success = await checkinSite(host, data);
+      if (!success) failedSites.push([host, data]);
+    });
+    await Promise.all(promises);
+
+    const maxRetries = 2;
+    for (let retry = 1; retry <= maxRetries && failedSites.length > 0; retry++) {
+      Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
+      const messageEl = progressToast.querySelector(".ldoh-toast-message");
+      if (messageEl) {
+        messageEl.textContent = `第 ${retry} 次重试 ${failedSites.length} 个失败站点...`;
+      }
+      const retrySites = [...failedSites];
+      failedSites.length = 0;
+      const retryPromises = retrySites.map(async ([host, data]) => {
+        const success = await checkinSite(host, data, false);
+        if (!success) failedSites.push([host, data]);
+      });
+      await Promise.all(retryPromises);
+      completedCount = sites.length - failedSites.length;
+      const progressMessageEl = progressToast.querySelector(".ldoh-toast-message");
+      if (progressMessageEl) {
+        progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+      }
+    }
+
+    Utils.toast.remove(progressToast);
+
+    let successCount = 0, alreadyCheckedCount = 0, timeoutCount = 0, failCount = 0;
+    for (const status of siteResults.values()) {
+      if (status === "success") successCount++;
+      else if (status === "already") alreadyCheckedCount++;
+      else if (status === "timeout") timeoutCount++;
+      else failCount++;
+    }
+
+    if (successCount > 0 || alreadyCheckedCount > 0) {
+      Utils.toast.success(
+        `签到完成！成功 ${successCount} 个，已签到 ${alreadyCheckedCount} 个`,
+        5000,
+      );
+    } else {
+      Utils.toast.warning(`签到完成，但没有成功的站点`, 5000);
+    }
+
+    FloatingPanel.refresh();
+  }
+
   // ==================== 自动签到功能结束 ====================
 
   GM_registerMenuCommand("🗑️ 清理缓存", () => {
