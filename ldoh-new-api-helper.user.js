@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.11
+// @version      1.0.12
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,10 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.12 (2026-02-25)
+ * - feat：新增「设置并发数」设置项，支持独立配置总并发数和后台并发数上限
+ * - refactor：并发控制从 CONFIG 常量改为运行时读取 SETTINGS_KEY，实时生效
  *
  * v1.0.11 (2026-02-25)
  * - feat：检测黑名单与签到跳过列表改为可配置，新增 BLACKLIST_KEY / CHECKIN_SKIP_KEY 存储
@@ -91,6 +95,8 @@
       "anyrouter.top", // 登录自动签到
     ],
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
+    DEFAULT_MAX_CONCURRENT: 15, // 默认最大总并发数
+    DEFAULT_MAX_BACKGROUND: 10, // 默认最大后台并发数
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
     MAX_CONCURRENT_REQUESTS: 15, // 最大并发请求数
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
@@ -913,17 +919,21 @@
       isInteractive = false,
     ) {
       // 并发控制：用户交互请求优先
+      const _concSettings = GM_getValue(CONFIG.SETTINGS_KEY, {});
+      const _maxConcurrent =
+        _concSettings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
+      const _maxBackground =
+        _concSettings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
       if (isInteractive) {
         // 交互请求：等待总并发数小于最大值
-        while (this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS) {
+        while (this._activeRequests >= _maxConcurrent) {
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
       } else {
-        // 后台请求：等待后台请求数小于限制（最多占用10个并发）
-        const MAX_BACKGROUND_REQUESTS = 10;
+        // 后台请求：等待后台请求数小于限制
         while (
-          this._activeRequests >= CONFIG.MAX_CONCURRENT_REQUESTS ||
-          this._activeBackgroundRequests >= MAX_BACKGROUND_REQUESTS
+          this._activeRequests >= _maxConcurrent ||
+          this._activeBackgroundRequests >= _maxBackground
         ) {
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
@@ -932,7 +942,7 @@
 
       this._activeRequests++;
       Log.debug(
-        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${CONFIG.MAX_CONCURRENT_REQUESTS}, 后台: ${this._activeBackgroundRequests}, 交互: ${isInteractive})`,
+        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${_maxConcurrent}, 后台: ${this._activeBackgroundRequests}, 交互: ${isInteractive})`,
       );
 
       try {
@@ -1007,6 +1017,8 @@
         let data = Utils.getSiteData(host);
         const settings = GM_getValue(CONFIG.SETTINGS_KEY, {
           interval: CONFIG.DEFAULT_INTERVAL,
+          maxConcurrent: CONFIG.DEFAULT_MAX_CONCURRENT,
+          maxBackground: CONFIG.DEFAULT_MAX_BACKGROUND,
         });
 
         // 检查是否需要更新（间隔逻辑）
@@ -2002,6 +2014,8 @@
     _settingsOutsideHandler: null,
     _intervalPop: null,
     _intervalOutsideHandler: null,
+    _concurrencyPop: null,
+    _concurrencyOutsideHandler: null,
 
     init() {
       if (document.getElementById("ldoh-fab")) return;
@@ -2039,7 +2053,8 @@
         const isOnPopover =
           (this._confirmPop && this._confirmPop.contains(e.target)) ||
           (this._settingsPop && this._settingsPop.contains(e.target)) ||
-          (this._intervalPop && this._intervalPop.contains(e.target));
+          (this._intervalPop && this._intervalPop.contains(e.target)) ||
+          (this._concurrencyPop && this._concurrencyPop.contains(e.target));
         if (
           this._isOpen &&
           !panel.contains(e.target) &&
@@ -2072,6 +2087,7 @@
       this._removeIntervalPopover();
       this._removeSettingsMenu();
       this._removeConfirmPopover();
+      this._removeConcurrencyPopover();
       this._panel.style.display = "none";
     },
 
@@ -2108,6 +2124,7 @@
       this._removeIntervalPopover();
       this._removeSettingsMenu();
       this._removeConfirmPopover();
+      this._removeConcurrencyPopover();
 
       const pop = document.createElement("div");
       pop.id = "ldoh-confirm-pop";
@@ -2168,6 +2185,122 @@
       }
     },
 
+    _removeConcurrencyPopover() {
+      if (this._concurrencyOutsideHandler) {
+        document.removeEventListener("click", this._concurrencyOutsideHandler);
+        this._concurrencyOutsideHandler = null;
+      }
+      if (this._concurrencyPop) {
+        this._concurrencyPop.remove();
+        this._concurrencyPop = null;
+      } else {
+        document.getElementById("ldoh-concurrency-pop")?.remove();
+      }
+    },
+
+    _showConcurrencyPopover(anchorEl) {
+      if (!anchorEl) return;
+      this._removeConfirmPopover();
+      this._removeSettingsMenu();
+      this._removeIntervalPopover();
+      this._removeConcurrencyPopover();
+
+      const s = GM_getValue(CONFIG.SETTINGS_KEY, {});
+      const curConcurrent = s.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
+      const curBackground = s.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
+
+      const pop = document.createElement("div");
+      pop.id = "ldoh-concurrency-pop";
+      pop.className = "ldoh-interval-pop";
+      pop.style.width = "240px";
+      pop.innerHTML = `
+        <div class="ldoh-interval-title">设置并发数</div>
+        <div style="margin-bottom:6px">
+          <div style="font-size:11px;color:var(--ldoh-text-light);margin-bottom:4px">总并发数（交互 + 后台, 默认值 15）</div>
+          <input id="ldoh-conc-total" class="ldoh-interval-input" type="number" min="1" max="50" step="1" value="${curConcurrent}">
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--ldoh-text-light);margin-bottom:4px">后台并发数上限（默认值 10）</div>
+          <input id="ldoh-conc-bg" class="ldoh-interval-input" type="number" min="1" max="50" step="1" value="${curBackground}">
+        </div>
+        <div class="ldoh-interval-hint">后台并发应 ≤ 总并发</div>
+        <div class="ldoh-interval-actions">
+          <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
+          <button class="ldoh-pop-btn ldoh-pop-confirm">保存</button>
+        </div>
+      `;
+
+      const rect = anchorEl.getBoundingClientRect();
+      pop.style.top = `${rect.bottom + 6}px`;
+      pop.style.right = `${window.innerWidth - rect.right}px`;
+      document.body.appendChild(pop);
+      this._concurrencyPop = pop;
+      pop.addEventListener("click", (e) => e.stopPropagation());
+
+      const totalInput = pop.querySelector("#ldoh-conc-total");
+      const bgInput = pop.querySelector("#ldoh-conc-bg");
+      const cancelBtn = pop.querySelector(".ldoh-pop-cancel");
+      const saveBtn = pop.querySelector(".ldoh-pop-confirm");
+
+      const applyValue = () => {
+        const total = parseInt(totalInput.value, 10);
+        const bg = parseInt(bgInput.value, 10);
+        if (isNaN(total) || total < 1) {
+          Utils.toast.error("总并发数无效，请输入不小于 1 的整数");
+          totalInput.focus();
+          return;
+        }
+        if (isNaN(bg) || bg < 1) {
+          Utils.toast.error("后台并发数无效，请输入不小于 1 的整数");
+          bgInput.focus();
+          return;
+        }
+        if (bg > total) {
+          Utils.toast.error("后台并发数不能大于总并发数");
+          bgInput.focus();
+          return;
+        }
+        const existing = GM_getValue(CONFIG.SETTINGS_KEY, {});
+        GM_setValue(CONFIG.SETTINGS_KEY, {
+          ...existing,
+          maxConcurrent: total,
+          maxBackground: bg,
+        });
+        Log.success(`并发数已设置：总 ${total}，后台 ${bg}`);
+        Utils.toast.success(`并发数已更新：总 ${total} / 后台 ${bg}`, 2000);
+        this._removeConcurrencyPopover();
+      };
+
+      cancelBtn.onclick = (e) => {
+        e.stopPropagation();
+        this._removeConcurrencyPopover();
+      };
+      saveBtn.onclick = (e) => {
+        e.stopPropagation();
+        applyValue();
+      };
+      [totalInput, bgInput].forEach((input) => {
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            applyValue();
+          }
+        });
+      });
+      setTimeout(() => totalInput.focus(), 0);
+
+      this._concurrencyOutsideHandler = (e) => {
+        if (!pop.contains(e.target) && !anchorEl.contains(e.target)) {
+          this._removeConcurrencyPopover();
+        }
+      };
+      setTimeout(
+        () =>
+          document.addEventListener("click", this._concurrencyOutsideHandler),
+        0,
+      );
+    },
+
     _removeSettingsMenu() {
       if (this._settingsOutsideHandler) {
         document.removeEventListener("click", this._settingsOutsideHandler);
@@ -2191,6 +2324,10 @@
         {
           label: "设置更新间隔",
           handler: (triggerEl) => this._showIntervalPopover(triggerEl),
+        },
+        {
+          label: "设置并发数",
+          handler: (triggerEl) => this._showConcurrencyPopover(triggerEl),
         },
         {
           label: "重置检测黑名单",
@@ -2254,6 +2391,7 @@
       if (!anchorEl) return;
       this._removeConfirmPopover();
       this._removeSettingsMenu();
+      this._removeConcurrencyPopover();
       this._removeIntervalPopover();
 
       const current = GM_getValue(CONFIG.SETTINGS_KEY, {
@@ -2331,6 +2469,7 @@
       this._removeIntervalPopover();
       this._removeSettingsMenu();
       this._removeConfirmPopover();
+      this._removeConcurrencyPopover();
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
       // 按余额从大到小排序，过滤无 userId 站点
@@ -3151,7 +3290,14 @@
       );
       console.log("%c配置信息", "color: #3b82f6; font-weight: bold");
       console.log("更新间隔:", settings.interval, "分钟");
-      console.log("并发限制:", CONFIG.MAX_CONCURRENT_REQUESTS);
+      console.log(
+        "总并发限制:",
+        settings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT,
+      );
+      console.log(
+        "后台并发限制:",
+        settings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND,
+      );
       console.log("请求超时:", CONFIG.REQUEST_TIMEOUT, "毫秒");
 
       console.log("\n%c站点白名单", "color: #f59e0b; font-weight: bold");
