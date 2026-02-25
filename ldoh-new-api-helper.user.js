@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.7
+// @version      1.0.8
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,10 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.8 (2026-02-25)
+ * - feat：新增右下角悬浮面板，仅在 LDOH 主站显示，按余额排序展示所有站点（签到、余额、密钥、刷新、定位）
+ * - feat：自动提取并缓存站点名称，悬浮面板优先显示友好名称
  *
  * v1.0.7 (2026-02-13)
  * - feat：新增黑名单机制，屏蔽已知非 New API 站点或者 CF 拦截站点
@@ -221,6 +225,103 @@
     .ldoh-toast-message { flex: 1; color: var(--ldoh-text); line-height: 1.5; }
     .ldoh-toast-close { width: 24px; height: 24px; flex-shrink: 0; cursor: pointer; color: var(--ldoh-text-light); display: flex; align-items: center; justify-content: center; border-radius: 6px; transition: all 0.2s; }
     .ldoh-toast-close:hover { background: #f1f5f9; color: var(--ldoh-text); }
+
+    /* ---- 悬浮面板 FAB ---- */
+    .ldoh-fab {
+      position: fixed; right: 20px; bottom: 20px; width: 44px; height: 44px;
+      border-radius: 50%; background: var(--ldoh-primary); color: white; border: none;
+      cursor: pointer; z-index: 800; display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 14px rgba(99, 102, 241, 0.45);
+      transition: all 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+    }
+    .ldoh-fab:hover { background: var(--ldoh-primary-hover); transform: scale(1.08); }
+    .ldoh-fab-badge {
+      position: absolute; top: -4px; right: -4px; background: var(--ldoh-danger); color: white;
+      border-radius: 99px; font-size: 9px; font-weight: 700; min-width: 16px; height: 16px;
+      display: flex; align-items: center; justify-content: center; padding: 0 3px; border: 2px solid white;
+    }
+    .ldoh-floating-panel {
+      position: fixed; right: 20px; bottom: 76px; width: 500px; max-height: 62vh;
+      background: #fff; border-radius: 16px; z-index: 799; flex-direction: column; overflow: hidden;
+      box-shadow: 0 20px 40px -8px rgba(0,0,0,0.18), 0 4px 12px -2px rgba(0,0,0,0.08);
+      border: 1px solid var(--ldoh-border); transform-origin: bottom right;
+    }
+    @keyframes ldoh-panel-in {
+      from { opacity: 0; transform: scale(0.85) translateY(16px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .ldoh-panel-in { animation: ldoh-panel-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
+    .ldoh-panel-hd {
+      padding: 10px 14px; border-bottom: 1px solid var(--ldoh-border);
+      display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+      background: linear-gradient(to right, #f8fafc, #fff);
+    }
+    .ldoh-panel-hd-title {
+      flex: 1; font-size: 13px; font-weight: 700; color: var(--ldoh-text);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .ldoh-panel-hd-total { font-size: 11px; color: var(--ldoh-text-light); }
+    .ldoh-panel-search {
+      padding: 7px 12px; border-bottom: 1px solid var(--ldoh-border); flex-shrink: 0; background: #fff;
+    }
+    .ldoh-panel-search-wrap { position: relative; }
+    .ldoh-panel-search-icon {
+      position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+      opacity: 0.35; pointer-events: none;
+    }
+    .ldoh-panel-search-input {
+      width: 100%; box-sizing: border-box; padding: 5px 8px 5px 28px;
+      border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 12px;
+      outline: none; background: #f8fafc; transition: border-color 0.2s, background 0.2s;
+    }
+    .ldoh-panel-search-input:focus { border-color: var(--ldoh-primary); background: #fff; }
+    .ldoh-panel-body { overflow-y: auto; flex: 1; scrollbar-width: thin; }
+    .ldoh-panel-row {
+      display: grid; grid-template-columns: 1fr 54px 64px 22px 22px 22px 22px;
+      align-items: center; gap: 6px; padding: 7px 12px;
+      border-bottom: 1px solid #f1f5f9; transition: background 0.15s; font-size: 12px;
+    }
+    .ldoh-panel-row:hover { background: #f8fafc; }
+    .ldoh-panel-row:last-child { border-bottom: none; }
+    .ldoh-panel-name {
+      font-weight: 600; color: var(--ldoh-text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .ldoh-panel-checkin {
+      font-size: 10px; padding: 2px 5px; border-radius: 8px; font-weight: 600; text-align: center;
+    }
+    .ldoh-panel-checkin.ok { background: #ecfdf5; color: #059669; }
+    .ldoh-panel-checkin.no { background: #fffbeb; color: #d97706; }
+    .ldoh-panel-checkin.na { background: #f1f5f9; color: var(--ldoh-text-light); }
+    .ldoh-panel-balance {
+      font-weight: 700; color: #d97706; font-family: ui-monospace, monospace;
+      font-size: 12px; text-align: right; white-space: nowrap;
+    }
+    .ldoh-panel-empty { padding: 32px; text-align: center; color: var(--ldoh-text-light); font-size: 13px; }
+
+    /* 删除确认气泡 */
+    .ldoh-confirm-pop {
+      position: fixed; z-index: 1000;
+      background: #fff; border: 1px solid var(--ldoh-border); border-radius: 10px;
+      box-shadow: 0 6px 20px -4px rgba(0,0,0,0.15);
+      padding: 8px 10px; display: flex; align-items: center; gap: 8px;
+      font-size: 12px; font-weight: 600; color: var(--ldoh-text); white-space: nowrap;
+      animation: ldoh-fade-in 0.15s ease-out;
+    }
+    .ldoh-confirm-pop::after {
+      content: ""; position: absolute; bottom: -5px; right: 10px;
+      width: 8px; height: 8px; background: #fff;
+      border-right: 1px solid var(--ldoh-border); border-bottom: 1px solid var(--ldoh-border);
+      transform: rotate(45deg);
+    }
+    .ldoh-pop-btn {
+      padding: 3px 10px; border-radius: 6px; border: none; font-size: 11px;
+      font-weight: 600; cursor: pointer; transition: all 0.15s;
+    }
+    .ldoh-pop-cancel { background: #f1f5f9; color: var(--ldoh-text); }
+    .ldoh-pop-cancel:hover { background: #e2e8f0; }
+    .ldoh-pop-confirm { background: var(--ldoh-danger); color: #fff; }
+    .ldoh-pop-confirm:hover { background: #dc2626; }
   `;
 
   // ==================== 工具函数 ====================
@@ -1081,6 +1182,7 @@
         refreshBtn.classList.add("loading");
         const fresh = await API.updateSiteStatus(host, data.userId, true);
         renderHelper(card, host, fresh);
+        FloatingPanel.refresh();
         Utils.toast.success(`${host} 数据已更新`);
       } catch (e) {
         Log.error(`[刷新失败] ${host}`, e);
@@ -1583,6 +1685,365 @@
     },
   };
 
+  // ==================== 卡片查找与悬浮面板 ====================
+
+  /**
+   * 从卡片 DOM 提取站点名称
+   * @param {HTMLElement} card - 卡片元素
+   * @param {string|null} fallback - 备用值
+   * @returns {string|null} 站点名称
+   */
+  function extractSiteName(card, fallback) {
+    // LDOH 卡片标准结构：站点名称在 h3 > a 中
+    const h3Link = card.querySelector("h3 a");
+    if (h3Link) {
+      const text = h3Link.textContent.trim();
+      if (text && text.length >= 2 && text.length <= 40 && !text.includes("http")) {
+        return text;
+      }
+    }
+    // 回退：h3 文本
+    const h3 = card.querySelector("h3");
+    if (h3) {
+      const text = h3.textContent.trim();
+      if (text && text.length >= 2 && text.length <= 40 && !text.includes("http")) {
+        return text;
+      }
+    }
+    return fallback;
+  }
+
+  /**
+   * 根据 host 查找对应的卡片元素
+   * @param {string} host - 主机名
+   * @returns {HTMLElement|null} 卡片元素
+   */
+  function findCardByHost(host) {
+    const normalizedHost = Utils.normalizeHost(host);
+    const cards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
+    for (const card of cards) {
+      const links = Array.from(card.querySelectorAll("a"));
+      const siteLink =
+        links.find((a) => a.href.startsWith("http") && !a.href.includes("linux.do")) ||
+        links[0];
+      if (!siteLink) continue;
+      try {
+        if (Utils.normalizeHost(new URL(siteLink.href).hostname) === normalizedHost)
+          return card;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  /**
+   * 悬浮面板（仅 LDOH 主站）
+   */
+  const FloatingPanel = {
+    _fab: null,
+    _panel: null,
+    _isOpen: false,
+    _searchQuery: "",
+
+    init() {
+      if (document.getElementById("ldoh-fab")) return;
+      Utils.injectStyles();
+
+      // FAB 按钮
+      const fab = document.createElement("button");
+      fab.id = "ldoh-fab";
+      fab.className = "ldoh-fab";
+      fab.title = "站点总览";
+      fab.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+          <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+        </svg>
+        <span class="ldoh-fab-badge" id="ldoh-fab-badge" style="display:none">0</span>
+      `;
+      fab.onclick = (e) => { e.stopPropagation(); this.toggle(); };
+      document.body.appendChild(fab);
+      this._fab = fab;
+
+      // 面板
+      const panel = document.createElement("div");
+      panel.id = "ldoh-floating-panel";
+      panel.className = "ldoh-floating-panel";
+      panel.style.display = "none";
+      document.body.appendChild(panel);
+      this._panel = panel;
+
+      // 点击面板外部关闭
+      document.addEventListener("click", (e) => {
+        if (this._isOpen && !panel.contains(e.target) && !fab.contains(e.target)) {
+          this.close();
+        }
+      });
+
+      this._updateBadge();
+      Log.debug("[FloatingPanel] 初始化完成");
+    },
+
+    toggle() {
+      this._isOpen ? this.close() : this.open();
+    },
+
+    open() {
+      this._isOpen = true;
+      this._panel.style.display = "flex";
+      this._panel.classList.add("ldoh-panel-in");
+      setTimeout(() => this._panel.classList.remove("ldoh-panel-in"), 300);
+      this.render();
+    },
+
+    close() {
+      this._isOpen = false;
+      this._searchQuery = "";
+      this._panel.style.display = "none";
+    },
+
+    refresh() {
+      this._updateBadge();
+      if (this._isOpen) this.render();
+    },
+
+    _updateBadge() {
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+      const count = Object.values(allData).filter((d) => d.userId).length;
+      const badge = document.getElementById("ldoh-fab-badge");
+      if (badge) {
+        badge.textContent = count;
+        badge.style.display = count > 0 ? "flex" : "none";
+      }
+    },
+
+    render() {
+      if (!this._panel) return;
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+
+      // 按余额从大到小排序，过滤无 userId 站点
+      const sorted = Object.entries(allData)
+        .filter(([, d]) => d.userId)
+        .sort(([, a], [, b]) => (b.quota || 0) - (a.quota || 0));
+
+      const totalBalance = sorted.reduce((sum, [, d]) => sum + (d.quota || 0), 0);
+
+      this._panel.innerHTML = "";
+
+      // 头部
+      const hd = document.createElement("div");
+      hd.className = "ldoh-panel-hd";
+      hd.innerHTML = `
+        <div class="ldoh-panel-hd-title">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+            <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+          </svg>
+          站点总览 <span class="ldh-sec-badge">${sorted.length}</span>
+        </div>
+        <div class="ldoh-panel-hd-total">合计 <strong style="color:#d97706">$${Utils.formatQuota(totalBalance)}</strong></div>
+      `;
+      const closeBtn = document.createElement("div");
+      closeBtn.className = "ldoh-btn";
+      closeBtn.title = "关闭";
+      closeBtn.style.flexShrink = "0";
+      closeBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+      closeBtn.onclick = () => this.close();
+      hd.appendChild(closeBtn);
+      this._panel.appendChild(hd);
+
+      // 搜索栏
+      const searchBar = document.createElement("div");
+      searchBar.className = "ldoh-panel-search";
+      searchBar.innerHTML = `
+        <div class="ldoh-panel-search-wrap">
+          <svg class="ldoh-panel-search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input class="ldoh-panel-search-input" placeholder="搜索站点名称..." value="${Utils.escapeHtml(this._searchQuery)}">
+        </div>
+      `;
+      this._panel.appendChild(searchBar);
+
+      // 列表
+      const body = document.createElement("div");
+      body.className = "ldoh-panel-body";
+
+      if (!sorted.length) {
+        const empty = document.createElement("div");
+        empty.className = "ldoh-panel-empty";
+        empty.innerHTML = `<div>暂无站点数据</div><div style="font-size:11px;margin-top:4px;opacity:0.7">访问各站点后自动收录</div>`;
+        body.appendChild(empty);
+      } else {
+        sorted.forEach(([host, siteData]) => {
+          const row = document.createElement("div");
+          row.className = "ldoh-panel-row";
+
+          // 签到状态
+          let checkinClass = "na", checkinText = "─";
+          if (siteData.checkinSupported !== false) {
+            if (siteData.checkedInToday === true) {
+              checkinClass = "ok"; checkinText = "已签到";
+            } else if (siteData.checkedInToday === false) {
+              checkinClass = "no"; checkinText = "未签到";
+            }
+          }
+
+          const displayName = siteData.siteName || host;
+          row.dataset.searchKey = `${displayName} ${host}`.toLowerCase();
+          if (this._searchQuery && !row.dataset.searchKey.includes(this._searchQuery)) {
+            row.style.display = "none";
+          }
+
+          const nameEl = document.createElement("div");
+          nameEl.className = "ldoh-panel-name";
+          nameEl.title = host;
+          nameEl.textContent = displayName;
+
+          const checkinEl = document.createElement("div");
+          checkinEl.className = `ldoh-panel-checkin ${checkinClass}`;
+          checkinEl.textContent = checkinText;
+
+          const balanceEl = document.createElement("div");
+          balanceEl.className = "ldoh-panel-balance";
+          balanceEl.textContent = `$${Utils.formatQuota(siteData.quota)}`;
+
+          row.appendChild(nameEl);
+          row.appendChild(checkinEl);
+          row.appendChild(balanceEl);
+
+          // 密钥按钮
+          const keyBtn = document.createElement("div");
+          keyBtn.className = "ldoh-btn";
+          keyBtn.title = "密钥与模型";
+          keyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`;
+          keyBtn.onclick = (e) => { e.stopPropagation(); showDetailsDialog(host, siteData); };
+
+          // 刷新按钮
+          const refreshBtn = document.createElement("div");
+          refreshBtn.className = "ldoh-btn ldoh-refresh-btn";
+          refreshBtn.title = "刷新数据";
+          refreshBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>`;
+          refreshBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (refreshBtn.classList.contains("loading")) return;
+            try {
+              refreshBtn.classList.add("loading");
+              const fresh = await API.updateSiteStatus(host, siteData.userId, true);
+              const card = findCardByHost(host);
+              if (card) renderHelper(card, host, fresh);
+              FloatingPanel.refresh();
+              Utils.toast.success(`${host} 已更新`);
+            } catch (err) {
+              Log.error(`[面板刷新] ${host}`, err);
+              Utils.toast.error("刷新失败");
+            } finally {
+              refreshBtn.classList.remove("loading");
+            }
+          };
+
+          // 定位按钮
+          const locateBtn = document.createElement("div");
+          locateBtn.className = "ldoh-btn";
+          locateBtn.title = "定位卡片";
+          locateBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>`;
+          locateBtn.onclick = (e) => {
+            e.stopPropagation();
+            const card = findCardByHost(host);
+            if (card) {
+              card.scrollIntoView({ behavior: "smooth", block: "center" });
+              card.style.outline = "2px solid var(--ldoh-primary)";
+              card.style.outlineOffset = "2px";
+              setTimeout(() => { card.style.outline = ""; card.style.outlineOffset = ""; }, 2000);
+            } else {
+              Utils.toast.warning(`未找到 ${host} 的卡片`);
+            }
+          };
+
+          row.appendChild(keyBtn);
+          row.appendChild(refreshBtn);
+          row.appendChild(locateBtn);
+
+          // 删除按钮
+          const deleteBtn = document.createElement("div");
+          deleteBtn.className = "ldoh-btn";
+          deleteBtn.title = "删除缓存数据";
+          deleteBtn.style.color = "var(--ldoh-danger)";
+          deleteBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
+          deleteBtn.onmouseenter = () => (deleteBtn.style.background = "rgba(239, 68, 68, 0.1)");
+          deleteBtn.onmouseleave = () => (deleteBtn.style.background = "transparent");
+          deleteBtn.onclick = (e) => {
+            e.stopPropagation();
+
+            // 关闭已有气泡
+            document.getElementById("ldoh-confirm-pop")?.remove();
+
+            const pop = document.createElement("div");
+            pop.id = "ldoh-confirm-pop";
+            pop.className = "ldoh-confirm-pop";
+            pop.innerHTML = `
+              <span>确认删除？</span>
+              <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
+              <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
+            `;
+
+            // 定位到删除按钮上方，右对齐
+            const rect = deleteBtn.getBoundingClientRect();
+            pop.style.top = `${rect.top - 48}px`;
+            pop.style.right = `${window.innerWidth - rect.right}px`;
+            document.body.appendChild(pop);
+
+            pop.querySelector(".ldoh-pop-cancel").onclick = (e2) => {
+              e2.stopPropagation();
+              pop.remove();
+            };
+
+            pop.querySelector(".ldoh-pop-confirm").onclick = (e2) => {
+              e2.stopPropagation();
+              pop.remove();
+              const all = GM_getValue(CONFIG.STORAGE_KEY, {});
+              delete all[Utils.normalizeHost(host)];
+              GM_setValue(CONFIG.STORAGE_KEY, all);
+              const card = findCardByHost(host);
+              if (card) {
+                const container = card.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`);
+                if (container) container.remove();
+              }
+              FloatingPanel.refresh();
+              Utils.toast.success(`已删除 ${host} 的缓存数据`);
+            };
+
+            // 点击外部关闭
+            const onOutside = (e2) => {
+              if (!pop.contains(e2.target) && e2.target !== deleteBtn) {
+                pop.remove();
+                document.removeEventListener("click", onOutside);
+              }
+            };
+            setTimeout(() => document.addEventListener("click", onOutside), 0);
+          };
+          row.appendChild(deleteBtn);
+
+          body.appendChild(row);
+        });
+      }
+      this._panel.appendChild(body);
+
+      // 绑定搜索过滤（在 body 渲染完成后绑定，避免先绑定找不到 rows）
+      const searchInput = searchBar.querySelector(".ldoh-panel-search-input");
+      let searchDebounceTimer = null;
+      searchInput.oninput = () => {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+          this._searchQuery = searchInput.value.toLowerCase().trim();
+          body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
+            const match = !this._searchQuery || row.dataset.searchKey.includes(this._searchQuery);
+            row.style.display = match ? "" : "none";
+          });
+        }, 200);
+      };
+      // 自动聚焦（仅在有已有内容时）
+      if (this._searchQuery) searchInput.focus();
+    },
+  };
+
   // ==================== LDOH ====================
   /**
    * 运行 LDOH模式（扫描并渲染所有卡片）
@@ -1624,7 +2085,16 @@
           }
 
           const normalizedHost = Utils.normalizeHost(host);
-          const data = Utils.getSiteData(normalizedHost);
+          let data = Utils.getSiteData(normalizedHost);
+
+          // 从 DOM 提取站点名称并更新（每次都更新，修正可能的缓存错误）
+          const siteName = extractSiteName(card, null);
+          if (siteName && siteName !== data.siteName) {
+            Utils.saveSiteData(normalizedHost, { siteName });
+            data = { ...data, siteName };
+          } else if (siteName) {
+            data = { ...data, siteName };
+          }
 
           if (data.userId) {
             Log.debug(`[LDOH] 渲染卡片: ${host}`);
@@ -1635,6 +2105,7 @@
             if (fresh.ts !== data.ts) {
               Log.debug(`[LDOH] 更新卡片: ${host}`);
               renderHelper(card, host, fresh);
+              FloatingPanel.refresh();
             }
           } else {
             // 标记为已检查，避免重复打印日志
@@ -1712,6 +2183,7 @@
         });
 
         Log.debug("[LDOH] MutationObserver 已启动");
+        FloatingPanel.init();
       } else {
         // 公益站：检测是否为 New API 站点
         Log.info("环境: 公益站");
