@@ -62,6 +62,8 @@
       "demo.voapi.top", // 非 New API 站点
       "windhub.cc", // 非 New API 站点
       "ai.qaq.al", // 非 New API 站点
+      "anyrouter.top", // CF 拦截
+      "agentrouter.org", // CF 拦截
     ],
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
