@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.9
+// @version      1.0.10
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -18,6 +18,10 @@
 
 /**
  * 版本更新日志
+ * v1.0.10 (2026-02-25)
+ * - fix：删除设置更新间隔时 30 分钟以下的二次确认限制，允许任意 ≥ 5 分钟的值
+ * - fix：设置更新间隔后不再刷新页面（interval 仅作缓存 TTL，运行时实时读取，无需重载）
+ *
  * v1.0.9 (2026-02-25)
  * - feat：新增自动签到功能
  *
@@ -324,6 +328,55 @@
     .ldoh-pop-cancel:hover { background: #e2e8f0; }
     .ldoh-pop-confirm { background: var(--ldoh-danger); color: #fff; }
     .ldoh-pop-confirm:hover { background: #dc2626; }
+
+    /* 设置菜单 */
+    .ldoh-settings-pop {
+      position: fixed; z-index: 1000;
+      background: #fff; border: 1px solid var(--ldoh-border); border-radius: 10px;
+      box-shadow: 0 6px 20px -4px rgba(0,0,0,0.15);
+      padding: 6px; min-width: 140px;
+      animation: ldoh-fade-in 0.15s ease-out;
+    }
+    .ldoh-settings-item {
+      width: 100%; border: none; background: transparent;
+      padding: 8px 10px; border-radius: 8px; cursor: pointer;
+      font-size: 12px; font-weight: 600; color: var(--ldoh-text);
+      text-align: left; transition: background 0.15s;
+    }
+    .ldoh-settings-item:hover { background: #f8fafc; }
+
+    .ldoh-interval-pop {
+      position: fixed; z-index: 1000;
+      background: #fff; border: 1px solid var(--ldoh-border); border-radius: 10px;
+      box-shadow: 0 6px 20px -4px rgba(0,0,0,0.15);
+      padding: 10px; width: 220px;
+      animation: ldoh-fade-in 0.15s ease-out;
+    }
+    .ldoh-interval-title {
+      font-size: 12px; font-weight: 700; color: var(--ldoh-text);
+      margin-bottom: 8px;
+    }
+    .ldoh-interval-hint {
+      font-size: 11px; color: var(--ldoh-text-light);
+      margin-top: 6px;
+    }
+    .ldoh-interval-input {
+      width: 100%;
+      border: 1px solid var(--ldoh-border);
+      border-radius: 8px;
+      padding: 7px 9px;
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      box-sizing: border-box;
+    }
+    .ldoh-interval-input:focus {
+      border-color: var(--ldoh-primary);
+      box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1);
+    }
+    .ldoh-interval-actions {
+      margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;
+    }
   `;
 
   // ==================== 工具函数 ====================
@@ -1814,6 +1867,10 @@
     _refreshAllRunning: false,
     _confirmPop: null,
     _confirmOutsideHandler: null,
+    _settingsPop: null,
+    _settingsOutsideHandler: null,
+    _intervalPop: null,
+    _intervalOutsideHandler: null,
 
     init() {
       if (document.getElementById("ldoh-fab")) return;
@@ -1848,10 +1905,15 @@
 
       // 点击面板外部关闭
       document.addEventListener("click", (e) => {
+        const isOnPopover =
+          (this._confirmPop && this._confirmPop.contains(e.target)) ||
+          (this._settingsPop && this._settingsPop.contains(e.target)) ||
+          (this._intervalPop && this._intervalPop.contains(e.target));
         if (
           this._isOpen &&
           !panel.contains(e.target) &&
-          !fab.contains(e.target)
+          !fab.contains(e.target) &&
+          !isOnPopover
         ) {
           this.close();
         }
@@ -1876,6 +1938,8 @@
     close() {
       this._isOpen = false;
       this._searchQuery = "";
+      this._removeIntervalPopover();
+      this._removeSettingsMenu();
       this._removeConfirmPopover();
       this._panel.style.display = "none";
     },
@@ -1910,6 +1974,8 @@
 
     _showConfirmPopover(anchorEl, text, onConfirm) {
       if (!anchorEl) return;
+      this._removeIntervalPopover();
+      this._removeSettingsMenu();
       this._removeConfirmPopover();
 
       const pop = document.createElement("div");
@@ -1958,8 +2024,159 @@
       );
     },
 
+    _removeIntervalPopover() {
+      if (this._intervalOutsideHandler) {
+        document.removeEventListener("click", this._intervalOutsideHandler);
+        this._intervalOutsideHandler = null;
+      }
+      if (this._intervalPop) {
+        this._intervalPop.remove();
+        this._intervalPop = null;
+      } else {
+        document.getElementById("ldoh-interval-pop")?.remove();
+      }
+    },
+
+    _removeSettingsMenu() {
+      if (this._settingsOutsideHandler) {
+        document.removeEventListener("click", this._settingsOutsideHandler);
+        this._settingsOutsideHandler = null;
+      }
+      if (this._settingsPop) {
+        this._settingsPop.remove();
+        this._settingsPop = null;
+      } else {
+        document.getElementById("ldoh-settings-pop")?.remove();
+      }
+    },
+
+    _showSettingsMenu(anchorEl) {
+      if (!anchorEl) return;
+      this._removeIntervalPopover();
+      this._removeConfirmPopover();
+      this._removeSettingsMenu();
+
+      const actions = [
+        {
+          label: "设置更新间隔",
+          handler: (triggerEl) => this._showIntervalPopover(triggerEl),
+        },
+      ];
+
+      const pop = document.createElement("div");
+      pop.id = "ldoh-settings-pop";
+      pop.className = "ldoh-settings-pop";
+
+      actions.forEach(({ label, handler }) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "ldoh-settings-item";
+        btn.textContent = label;
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          this._removeSettingsMenu();
+          handler(anchorEl);
+        };
+        pop.appendChild(btn);
+      });
+
+      const rect = anchorEl.getBoundingClientRect();
+      pop.style.top = `${rect.bottom + 6}px`;
+      pop.style.right = `${window.innerWidth - rect.right}px`;
+      document.body.appendChild(pop);
+      this._settingsPop = pop;
+
+      this._settingsOutsideHandler = (e) => {
+        if (!pop.contains(e.target) && !anchorEl.contains(e.target)) {
+          this._removeSettingsMenu();
+        }
+      };
+      setTimeout(
+        () => document.addEventListener("click", this._settingsOutsideHandler),
+        0,
+      );
+    },
+
+    _showIntervalPopover(anchorEl) {
+      if (!anchorEl) return;
+      this._removeConfirmPopover();
+      this._removeSettingsMenu();
+      this._removeIntervalPopover();
+
+      const current = GM_getValue(CONFIG.SETTINGS_KEY, {
+        interval: CONFIG.DEFAULT_INTERVAL,
+      }).interval;
+
+      const pop = document.createElement("div");
+      pop.id = "ldoh-interval-pop";
+      pop.className = "ldoh-interval-pop";
+      pop.innerHTML = `
+        <div class="ldoh-interval-title">设置更新间隔</div>
+        <input class="ldoh-interval-input" type="number" min="5" step="1" value="${current}">
+        <div class="ldoh-interval-hint">单位：分钟，最小值 5 分钟</div>
+        <div class="ldoh-interval-actions">
+          <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
+          <button class="ldoh-pop-btn ldoh-pop-confirm">保存</button>
+        </div>
+      `;
+
+      const rect = anchorEl.getBoundingClientRect();
+      pop.style.top = `${rect.bottom + 6}px`;
+      pop.style.right = `${window.innerWidth - rect.right}px`;
+      document.body.appendChild(pop);
+      this._intervalPop = pop;
+      pop.addEventListener("click", (e) => e.stopPropagation());
+
+      const inputEl = pop.querySelector(".ldoh-interval-input");
+      const cancelBtn = pop.querySelector(".ldoh-pop-cancel");
+      const saveBtn = pop.querySelector(".ldoh-pop-confirm");
+
+      const applyValue = () => {
+        const val = String(inputEl.value || "").trim();
+        const interval = parseInt(val, 10);
+        if (isNaN(interval) || interval < 5) {
+          Utils.toast.error("无效的间隔值，请输入不小于 5 的整数");
+          inputEl.focus();
+          return;
+        }
+
+        GM_setValue(CONFIG.SETTINGS_KEY, { interval });
+        Log.success(`更新间隔已设置为 ${interval} 分钟`);
+        Utils.toast.success(`更新间隔已设置为 ${interval} 分钟`, 2000);
+        this._removeIntervalPopover();
+      };
+
+      cancelBtn.onclick = (e) => {
+        e.stopPropagation();
+        this._removeIntervalPopover();
+      };
+      saveBtn.onclick = (e) => {
+        e.stopPropagation();
+        applyValue();
+      };
+      inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          applyValue();
+        }
+      });
+      setTimeout(() => inputEl.focus(), 0);
+
+      this._intervalOutsideHandler = (e) => {
+        if (!pop.contains(e.target) && !anchorEl.contains(e.target)) {
+          this._removeIntervalPopover();
+        }
+      };
+      setTimeout(
+        () => document.addEventListener("click", this._intervalOutsideHandler),
+        0,
+      );
+    },
+
     render() {
       if (!this._panel) return;
+      this._removeIntervalPopover();
+      this._removeSettingsMenu();
       this._removeConfirmPopover();
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
@@ -2045,8 +2262,20 @@
         });
       };
 
+      // 设置按钮
+      const settingsBtn = document.createElement("div");
+      settingsBtn.className = "ldoh-btn";
+      settingsBtn.title = "设置";
+      settingsBtn.style.flexShrink = "0";
+      settingsBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 .99-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51.99H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+      settingsBtn.onclick = (e) => {
+        e.stopPropagation();
+        this._showSettingsMenu(settingsBtn);
+      };
+
       hd.appendChild(refreshAllBtn);
       hd.appendChild(checkinBtn);
+      hd.appendChild(settingsBtn);
       hd.appendChild(closeBtn);
       this._panel.appendChild(hd);
 
@@ -2458,43 +2687,6 @@
   init();
 
   // ==================== 菜单命令 ====================
-  GM_registerMenuCommand("⚙️ 设置更新间隔", () => {
-    try {
-      const current = GM_getValue(CONFIG.SETTINGS_KEY, {
-        interval: CONFIG.DEFAULT_INTERVAL,
-      }).interval;
-      const val = prompt(
-        `请输入更新间隔（分钟）\n当前值: ${current} 分钟\n建议范围: 30-120 分钟`,
-        current,
-      );
-
-      if (val === null) return; // 用户取消
-
-      const interval = parseInt(val, 10);
-      if (isNaN(interval) || interval < 1) {
-        Utils.toast.error("无效的间隔值，请输入大于 0 的整数");
-        return;
-      }
-
-      if (interval < 30) {
-        const confirm = window.confirm(
-          `⚠️ 间隔时间较短（${interval} 分钟）可能导致频繁请求。\n是否继续？`,
-        );
-        if (!confirm) return;
-      }
-
-      GM_setValue(CONFIG.SETTINGS_KEY, { interval });
-      Log.success(`更新间隔已设置为 ${interval} 分钟`);
-      Utils.toast.success(
-        `更新间隔已设置为 ${interval} 分钟，页面将刷新`,
-        2000,
-      );
-      setTimeout(() => location.reload(), 2000);
-    } catch (e) {
-      Log.error("设置更新间隔失败", e);
-      Utils.toast.error("设置失败，请查看控制台");
-    }
-  });
 
   /**
    * 刷新所有站点数据
