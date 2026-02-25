@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.12
+// @version      1.0.13
 // @description  LDOH New API 助手（余额查询、签到状态、密钥获取、模型列表）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -10,7 +10,6 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
-// @grant        GM_registerMenuCommand
 // @connect      *
 // @run-at       document-idle
 // @license      MIT
@@ -18,6 +17,12 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.13 (2026-02-25)
+ * - feat：删除 GM 菜单中的「清理缓存」「调试：查看缓存」「关于」选项
+ * - feat：悬浮面板新增「清理缓存」、「刷新站点白名单」设置项（从当前页面 DOM 重新扫描站点列表）
+ * - feat：「关于」改为「使用说明」，覆盖所有功能要点，通过 overlay 对话框展示
+ * - refactor：移除 GM_registerMenuCommand，去掉 GM_registerMenuCommand grant
  *
  * v1.0.12 (2026-02-25)
  * - feat：新增「设置并发数」设置项，支持独立配置总并发数和后台并发数上限
@@ -189,7 +194,7 @@
     @keyframes ldoh-fade-in-blur { from { opacity: 0; backdrop-filter: blur(0); } to { opacity: 1; backdrop-filter: blur(6px); } }
 
     .ldh-dialog {
-      background: #fff; width: min(680px, 94vw); max-height: 85vh;
+      background: #fff; width: min(520px, 94vw); max-height: 85vh;
       border-radius: 20px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
       display: flex; flex-direction: column; overflow: hidden;
       border: 1px solid rgba(255, 255, 255, 0.2);
@@ -355,12 +360,12 @@
       position: fixed; z-index: 1000;
       background: #fff; border: 1px solid var(--ldoh-border); border-radius: 10px;
       box-shadow: 0 6px 20px -4px rgba(0,0,0,0.15);
-      padding: 6px; min-width: 140px;
+      padding: 6px; width: 140px;
       animation: ldoh-fade-in 0.15s ease-out;
     }
     .ldoh-settings-item {
       width: 100%; border: none; background: transparent;
-      padding: 8px 10px; border-radius: 8px; cursor: pointer;
+      padding: 8px 10px; border-radius: 8px; cursor: pointer; white-space: nowrap;
       font-size: 12px; font-weight: 600; color: var(--ldoh-text);
       text-align: left; transition: background 0.15s;
     }
@@ -2351,17 +2356,56 @@
             });
           },
         },
+        {
+          label: "刷新站点白名单",
+          handler: () => {
+            const list = Utils.updateSiteWhitelist();
+            Utils.toast.success(`站点白名单已刷新，共 ${list.length} 个站点`);
+          },
+        },
+        {
+          label: "清理缓存",
+          danger: true,
+          handler: (triggerEl) => {
+            const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+            const siteCount = Object.keys(allData).length;
+            if (siteCount === 0) {
+              Utils.toast.info("缓存已经是空的");
+              return;
+            }
+            this._showConfirmPopover(
+              triggerEl,
+              `确认清除 ${siteCount} 个站点的缓存？`,
+              () => {
+                try {
+                  GM_setValue(CONFIG.STORAGE_KEY, {});
+                  Log.success("缓存已清理");
+                  Utils.toast.success("缓存已清理，页面将刷新", 2000);
+                  setTimeout(() => location.reload(), 2000);
+                } catch (e) {
+                  Log.error("清理缓存失败", e);
+                  Utils.toast.error("清理失败，请查看控制台");
+                }
+              },
+            );
+          },
+        },
+        {
+          label: "使用说明",
+          handler: () => this._showHelpDialog(),
+        },
       ];
 
       const pop = document.createElement("div");
       pop.id = "ldoh-settings-pop";
       pop.className = "ldoh-settings-pop";
 
-      actions.forEach(({ label, handler }) => {
+      actions.forEach(({ label, handler, danger }) => {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "ldoh-settings-item";
         btn.textContent = label;
+        if (danger) btn.style.color = "var(--ldoh-danger, #ef4444)";
         btn.onclick = (e) => {
           e.stopPropagation();
           this._removeSettingsMenu();
@@ -2385,6 +2429,68 @@
         () => document.addEventListener("click", this._settingsOutsideHandler),
         0,
       );
+    },
+
+    _showHelpDialog() {
+      const settings = GM_getValue(CONFIG.SETTINGS_KEY, {});
+      const interval = settings.interval || CONFIG.DEFAULT_INTERVAL;
+      const maxConcurrent =
+        settings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
+      const maxBackground =
+        settings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
+      const html = `
+        <div style="padding:24px">
+        <h2 style="margin:0 0 16px;font-size:16px;font-weight:700;color:var(--ldoh-text)">使用说明</h2>
+        <div style="font-size:13px;color:var(--ldoh-text-muted);line-height:1.7;max-height:60vh;overflow-y:auto;padding-right:4px">
+          <p style="margin:0 0 12px"><strong style="color:var(--ldoh-text)">LDOH New API Helper v1.0.15</strong><br>自动同步 LDOH 白名单站点的额度与签到状态，并提供悬浮面板快速操作。</p>
+
+          <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">核心功能</p>
+          <ul style="margin:0 0 12px;padding-left:16px">
+            <li>自动获取并展示各站点余额 / 已用额度</li>
+            <li>自动检测当日签到状态，支持一键批量签到</li>
+            <li>支持一键刷新全部站点数据</li>
+            <li>支持复制 API Key 与跳转到模型列表页</li>
+          </ul>
+
+          <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">悬浮面板</p>
+          <ul style="margin:0 0 12px;padding-left:16px">
+            <li>右下角悬浮按钮，点击展开站点列表面板</li>
+            <li>支持关键词搜索过滤站点</li>
+            <li>每行可独立刷新、签到、复制 Key、查看模型</li>
+            <li>每行可切换「检测黑名单」和「签到黑名单」状态（绿色=启用，灰色=屏蔽）</li>
+          </ul>
+
+          <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">白名单 / 黑名单</p>
+          <ul style="margin:0 0 12px;padding-left:16px">
+            <li>仅识别 LDOH 页面上的白名单站点</li>
+            <li>可在设置中「刷新站点白名单」重新扫描当前页面</li>
+            <li>检测黑名单：被屏蔽的站点不会发送 API 请求</li>
+            <li>签到黑名单：被屏蔽的站点跳过自动签到</li>
+            <li>内置黑名单条目可被用户覆盖移除；设置中可整体重置</li>
+          </ul>
+
+          <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">设置项</p>
+          <ul style="margin:0 0 12px;padding-left:16px">
+            <li>更新间隔：当前 <strong style="color:var(--ldoh-text)">${interval} 分钟</strong>（最小 5 分钟），控制缓存 TTL</li>
+            <li>总并发数：当前 <strong style="color:var(--ldoh-text)">${maxConcurrent}</strong>，同时发出的最大请求数</li>
+            <li>后台并发数：当前 <strong style="color:var(--ldoh-text)">${maxBackground}</strong>，后台自动刷新时的最大并发</li>
+            <li>清理缓存：清除所有站点的本地缓存数据（需二次确认）</li>
+          </ul>
+
+          <p style="margin:0 0 4px;font-size:11px">作者：@JoJoJotarou &nbsp;·&nbsp; 许可：MIT License</p>
+        </div>
+        <div style="text-align:right;margin-top:16px">
+          <button type="button" class="ldh-dialog-close" style="padding:6px 20px;border-radius:6px;background:var(--ldoh-surface2);color:var(--ldoh-text);border:none;cursor:pointer;font-size:13px">关闭</button>
+        </div>
+        </div>`;
+      const ov = UI.createOverlay(html);
+      const closeBtn = ov.querySelector(".ldh-dialog-close");
+      if (closeBtn) {
+        closeBtn.onclick = () => {
+          ov.style.opacity = "0";
+          setTimeout(() => ov.remove(), 200);
+        };
+      }
     },
 
     _showIntervalPopover(anchorEl) {
@@ -3250,100 +3356,4 @@
   }
 
   // ==================== 自动签到功能结束 ====================
-
-  GM_registerMenuCommand("🗑️ 清理缓存", () => {
-    try {
-      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-      const siteCount = Object.keys(allData).length;
-
-      if (siteCount === 0) {
-        Utils.toast.info("缓存已经是空的");
-        return;
-      }
-
-      const confirm = window.confirm(
-        `⚠️ 将清除 ${siteCount} 个站点的缓存数据\n此操作不可恢复，是否继续？`,
-      );
-      if (!confirm) return;
-
-      GM_setValue(CONFIG.STORAGE_KEY, {});
-      Log.success("缓存已清理");
-      Utils.toast.success("缓存已清理，页面将刷新", 2000);
-      setTimeout(() => location.reload(), 2000);
-    } catch (e) {
-      Log.error("清理缓存失败", e);
-      Utils.toast.error("清理失败，请查看控制台");
-    }
-  });
-
-  GM_registerMenuCommand("🐛 调试：查看缓存", () => {
-    try {
-      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-      const settings = GM_getValue(CONFIG.SETTINGS_KEY, {
-        interval: CONFIG.DEFAULT_INTERVAL,
-      });
-      const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
-
-      console.group(
-        "%c[NewAPI Helper] 调试信息",
-        "color: #8b5cf6; font-weight: bold; font-size: 14px",
-      );
-      console.log("%c配置信息", "color: #3b82f6; font-weight: bold");
-      console.log("更新间隔:", settings.interval, "分钟");
-      console.log(
-        "总并发限制:",
-        settings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT,
-      );
-      console.log(
-        "后台并发限制:",
-        settings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND,
-      );
-      console.log("请求超时:", CONFIG.REQUEST_TIMEOUT, "毫秒");
-
-      console.log("\n%c站点白名单", "color: #f59e0b; font-weight: bold");
-      console.log("白名单站点数量:", whitelist.length);
-      console.log("白名单站点列表:", whitelist);
-
-      console.log("\n%c站点数据", "color: #10b981; font-weight: bold");
-      console.log("站点数量:", Object.keys(allData).length);
-      console.table(
-        Object.entries(allData).map(([host, data]) => ({
-          站点: host,
-          用户ID: data.userId || "无",
-          额度:
-            data.quota !== undefined
-              ? `$${Utils.formatQuota(data.quota)}`
-              : "未知",
-          已签到: data.checkedInToday ? "是" : "否",
-          最后更新: data.ts
-            ? new Date(data.ts).toLocaleString("zh-CN")
-            : "从未",
-        })),
-      );
-      console.groupEnd();
-
-      Utils.toast.success("调试信息已输出到控制台，请按 F12 查看", 4000);
-    } catch (e) {
-      Log.error("查看缓存失败", e);
-      Utils.toast.error("查看失败，请查看控制台");
-    }
-  });
-
-  GM_registerMenuCommand("ℹ️ 关于", () => {
-    alert(
-      `LDOH New API Helper v1.0.3\n\n` +
-        `✨ 功能特性：\n` +
-        `• 自动同步站点额度和签到状态\n` +
-        `• 现代化的 UI 交互体验\n` +
-        `• 密钥与模型智能过滤筛选\n` +
-        `• 高性能并发请求控制系统\n` +
-        `• 仅识别 LDOH 白名单中的站点\n\n` +
-        `🎨 界面优化：\n` +
-        `• 全新设计的现代感界面 (Tailwind Style)\n` +
-        `• 极速响应的动画与微交互\n` +
-        `• 精心调校的排版与色彩方案\n\n` +
-        `📝 作者: @JoJoJotarou\n` +
-        `📄 许可: MIT License`,
-    );
-  });
 })();
