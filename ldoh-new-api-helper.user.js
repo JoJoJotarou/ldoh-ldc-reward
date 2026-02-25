@@ -1092,6 +1092,57 @@
         return { success: false, error: "删除密钥异常" };
       }
     },
+
+    /**
+     * 签到
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @returns {Promise<object>} 签到结果
+     */
+    async checkin(host, token, userId) {
+      try {
+        Log.debug(`[签到] ${host}`);
+
+        // 创建带超时的请求
+        const timeoutPromise = new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({ success: false, error: "签到超时（15秒）" });
+          }, 15000);
+        });
+
+        const requestPromise = this.request(
+          "POST",
+          host,
+          "/api/user/checkin",
+          token,
+          userId,
+          null,
+          false,
+        );
+
+        const res = await Promise.race([requestPromise, timeoutPromise]);
+
+        if (res.success) {
+          const quotaAwarded = res.data?.quota_awarded || 0;
+          Log.success(
+            `[签到成功] ${host} - 获得额度: ${Utils.formatQuota(quotaAwarded)}`,
+          );
+        } else if (res.message && res.message.includes("已签到")) {
+          // 今日已签到，视为成功
+          Log.success(`[已签到] ${host} - 今日已签到`);
+          // 标记为已签到状态，便于上层处理
+          res.alreadyCheckedIn = true;
+        } else {
+          Log.warn(`[签到失败] ${host}`, res);
+        }
+
+        return res;
+      } catch (e) {
+        Log.error(`[签到异常] ${host}`, e);
+        return { success: false, error: "签到异常" };
+      }
+    },
   };
 
   // ==================== UI 渲染函数 ====================
@@ -2390,6 +2441,223 @@
       Utils.toast.error("刷新失败，请查看控制台");
     }
   });
+
+  // ==================== 自动签到功能 ====================
+  // 注意：此功能需要配合数据结构修改
+  // 需要将 checkedInToday (boolean) 改为 lastCheckinDate (string, 格式: "YYYY-MM-DD")
+  // 涉及修改的地方：
+  // 1. updateSiteStatus 方法中保存签到状态时使用日期
+  // 2. renderHelper 函数中判断签到状态时比较日期
+
+  /**
+   * 获取今天的日期字符串
+   * @returns {string} 格式: "YYYY-MM-DD"
+   */
+  function getTodayDateString() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  }
+
+  GM_registerMenuCommand("🎁 自动签到所有站点", async () => {
+    try {
+      const isPortal = window.location.hostname === "ldoh.105117.xyz";
+      if (!isPortal) {
+        Utils.toast.warning("此功能仅在 LDOH 页面可用");
+        return;
+      }
+
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+      const today = getTodayDateString();
+      const BLACKLIST = [
+        "justdoitme.me", // CF Turnstile 拦截
+        "api.67.si", // CF Turnstile 拦截
+        "anyrouter.top", // 登录自动签到
+      ]; // 排除自动签到的站点列表
+      // 筛选需要签到的站点（有 userId 和 token，且今天未签到，且不在黑名单中）
+      const sites = Object.entries(allData).filter(([host, data]) => {
+        if (!data.userId || !data.token || !data.checkinSupported) return false;
+        if (BLACKLIST.includes(host)) return false;
+        const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
+        // lastCheckinDate 不是今天，或 API 明确返回今天未签到（兼容 lastCheckinDate 被错误设置的情况）
+        return lastCheckinDate !== today || data.checkedInToday === false;
+      });
+
+      if (sites.length === 0) {
+        Utils.toast.info("所有站点今天都已签到");
+        return;
+      }
+
+      // 构建站点列表信息
+      const siteList = sites
+        .map(([host, data]) => {
+          const lastCheckin = data.lastCheckinDate || "从未";
+          return `  • ${host} (上次: ${lastCheckin})`;
+        })
+        .join("\n");
+
+      const confirm = window.confirm(
+        `🎁 将对以下 ${sites.length} 个站点进行自动签到：\n\n${siteList}\n\n注意：部分站点可能有 CF 校验，签到可能失败或超时（10秒）\n\n是否继续？`,
+      );
+      if (!confirm) return;
+
+      Log.info(`开始自动签到 ${sites.length} 个站点`);
+
+      // 创建持久的进度 toast
+      const progressToast = Utils.toast.show(
+        `正在签到 0/${sites.length}...`,
+        "info",
+        0,
+      );
+
+      // 按站点最终状态统计（key: host, value: 'success'|'already'|'timeout'|'fail'）
+      const siteResults = new Map();
+      let completedCount = 0;
+
+      // 失败的站点列表（用于重试）
+      const failedSites = [];
+
+      // 签到单个站点的函数
+      const checkinSite = async (host, data, updateProgress = true) => {
+        try {
+          const result = await API.checkin(host, data.token, data.userId);
+
+          if (updateProgress) {
+            completedCount++;
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
+            if (messageEl) {
+              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+            }
+          }
+
+          if (result.success) {
+            siteResults.set(host, "success");
+            const siteData = Utils.getSiteData(host);
+            siteData.lastCheckinDate = today;
+            siteData.checkedInToday = true;
+            if (result.data?.quota_awarded) {
+              siteData.quota =
+                (siteData.quota || 0) + result.data.quota_awarded;
+            }
+            Utils.saveSiteData(host, siteData);
+            return true; // 成功
+          } else if (result.alreadyCheckedIn) {
+            siteResults.set(host, "already");
+            const siteData = Utils.getSiteData(host);
+            siteData.lastCheckinDate = today;
+            siteData.checkedInToday = true;
+            Utils.saveSiteData(host, siteData);
+            return true; // 成功
+          } else if (result.error === "签到超时（15秒）") {
+            siteResults.set(host, "timeout");
+            return false; // 失败，可重试
+          } else {
+            siteResults.set(host, "fail");
+            return false; // 失败，可重试
+          }
+        } catch (e) {
+          Log.error(`签到站点失败: ${host}`, e);
+          siteResults.set(host, "fail");
+          if (updateProgress) {
+            completedCount++;
+            const messageEl = progressToast.querySelector(
+              ".ldoh-toast-message",
+            );
+            if (messageEl) {
+              messageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+            }
+          }
+          return false; // 失败，可重试
+        }
+      };
+
+      // 第一轮签到所有站点
+      const promises = sites.map(async ([host, data]) => {
+        const success = await checkinSite(host, data);
+        if (!success) {
+          failedSites.push([host, data]);
+        }
+      });
+
+      await Promise.all(promises);
+
+      // 重试逻辑：最多重试2次
+      const maxRetries = 2;
+      for (
+        let retry = 1;
+        retry <= maxRetries && failedSites.length > 0;
+        retry++
+      ) {
+        Log.info(`第 ${retry} 次重试 ${failedSites.length} 个失败的站点`);
+
+        // 更新进度提示
+        const messageEl = progressToast.querySelector(".ldoh-toast-message");
+        if (messageEl) {
+          messageEl.textContent = `第 ${retry} 次重试 ${failedSites.length} 个失败站点...`;
+        }
+
+        // 重置本轮重试前的失败计数（重新统计）
+        const retrySites = [...failedSites];
+        failedSites.length = 0;
+
+        // 重试失败的站点
+        const retryPromises = retrySites.map(async ([host, data]) => {
+          const success = await checkinSite(host, data, false);
+          if (!success) {
+            failedSites.push([host, data]);
+          }
+        });
+
+        await Promise.all(retryPromises);
+
+        // 更新完成计数
+        completedCount = sites.length - failedSites.length;
+        const progressMessageEl = progressToast.querySelector(
+          ".ldoh-toast-message",
+        );
+        if (progressMessageEl) {
+          progressMessageEl.textContent = `正在签到 ${completedCount}/${sites.length}...`;
+        }
+      }
+
+      // 移除进度 toast
+      Utils.toast.remove(progressToast);
+
+      // 从 Map 汇总各站点最终状态
+      let successCount = 0;
+      let alreadyCheckedCount = 0;
+      let timeoutCount = 0;
+      let failCount = 0;
+      for (const status of siteResults.values()) {
+        if (status === "success") successCount++;
+        else if (status === "already") alreadyCheckedCount++;
+        else if (status === "timeout") timeoutCount++;
+        else failCount++;
+      }
+
+      // 显示结果
+      const resultMessage = `签到完成！\n\n✅ 成功: ${successCount}\n⏭️ 已签到: ${alreadyCheckedCount}\n⏱️ 超时: ${timeoutCount}\n❌ 失败: ${failCount}\n📊 总计: ${sites.length}`;
+
+      Log.success(resultMessage.replace(/\n/g, " "));
+
+      if (successCount > 0 || alreadyCheckedCount > 0) {
+        Utils.toast.success(
+          `签到完成！成功 ${successCount} 个，已签到 ${alreadyCheckedCount} 个`,
+          5000,
+        );
+      } else {
+        Utils.toast.warning(`签到完成，但没有成功的站点`, 5000);
+      }
+
+      // 刷新页面以更新显示
+      //   setTimeout(() => location.reload(), 2000);
+    } catch (e) {
+      Log.error("自动签到失败", e);
+      Utils.toast.error("自动签到失败，请查看控制台");
+    }
+  });
+  // ==================== 自动签到功能结束 ====================
 
   GM_registerMenuCommand("🗑️ 清理缓存", () => {
     try {
