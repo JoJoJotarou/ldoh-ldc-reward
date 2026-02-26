@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.13
+// @version      1.0.14
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -17,6 +17,11 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.14 (2026-02-26)
+ * - fix：签到状态渲染改为对比 lastCheckinDate 与当天日期，避免跨日后仍显示「已签到」
+ * - feat：新增后台自动定时刷新，按 interval 设定周期自动更新过期缓存
+ * - perf：并发控制从 100ms 轮询改为 semaphore 事件唤醒，刷新全部自动受并发上限约束
  *
  * v1.0.13 (2026-02-25)
  * - feat：删除 GM 菜单中的「清理缓存」「调试：查看缓存」「关于」选项
@@ -103,7 +108,6 @@
     DEFAULT_MAX_CONCURRENT: 15, // 默认最大总并发数
     DEFAULT_MAX_BACKGROUND: 10, // 默认最大后台并发数
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
-    MAX_CONCURRENT_REQUESTS: 15, // 最大并发请求数
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
     DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
     LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
@@ -898,10 +902,59 @@
 
   // ==================== API 请求模块 ====================
   const API = {
-    // 并发请求队列
-    _requestQueue: [],
+    // 并发信号量
+    _waiters: [], // { resolve, isInteractive }[]
     _activeRequests: 0,
-    _activeBackgroundRequests: 0, // 后台请求计数
+    _activeBackgroundRequests: 0,
+
+    /** 释放一个槽位，尝试唤醒等待队列中下一个可执行的请求 */
+    _release(isInteractive) {
+      this._activeRequests--;
+      if (!isInteractive) this._activeBackgroundRequests--;
+      const settings = GM_getValue(CONFIG.SETTINGS_KEY, {});
+      const maxConcurrent =
+        settings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
+      const maxBackground =
+        settings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
+      // 优先唤醒交互请求
+      let idx = this._waiters.findIndex(
+        (w) => w.isInteractive && this._activeRequests < maxConcurrent,
+      );
+      if (idx < 0) {
+        idx = this._waiters.findIndex(
+          (w) =>
+            !w.isInteractive &&
+            this._activeRequests < maxConcurrent &&
+            this._activeBackgroundRequests < maxBackground,
+        );
+      }
+      if (idx >= 0) {
+        const w = this._waiters.splice(idx, 1)[0];
+        this._activeRequests++;
+        if (!w.isInteractive) this._activeBackgroundRequests++;
+        w.resolve();
+      }
+    },
+
+    /** 获取一个槽位，若无可用槽位则挂起等待 */
+    async _acquire(isInteractive) {
+      const settings = GM_getValue(CONFIG.SETTINGS_KEY, {});
+      const maxConcurrent =
+        settings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
+      const maxBackground =
+        settings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
+      const canRun = () =>
+        this._activeRequests < maxConcurrent &&
+        (isInteractive || this._activeBackgroundRequests < maxBackground);
+      if (!canRun()) {
+        await new Promise((resolve) =>
+          this._waiters.push({ resolve, isInteractive }),
+        );
+        return; // 计数已由 _release 中预增
+      }
+      this._activeRequests++;
+      if (!isInteractive) this._activeBackgroundRequests++;
+    },
 
     /**
      * 发送 HTTP 请求（带并发控制和优先级）
@@ -923,31 +976,9 @@
       body = null,
       isInteractive = false,
     ) {
-      // 并发控制：用户交互请求优先
-      const _concSettings = GM_getValue(CONFIG.SETTINGS_KEY, {});
-      const _maxConcurrent =
-        _concSettings.maxConcurrent || CONFIG.DEFAULT_MAX_CONCURRENT;
-      const _maxBackground =
-        _concSettings.maxBackground || CONFIG.DEFAULT_MAX_BACKGROUND;
-      if (isInteractive) {
-        // 交互请求：等待总并发数小于最大值
-        while (this._activeRequests >= _maxConcurrent) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-      } else {
-        // 后台请求：等待后台请求数小于限制
-        while (
-          this._activeRequests >= _maxConcurrent ||
-          this._activeBackgroundRequests >= _maxBackground
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-        this._activeBackgroundRequests++;
-      }
-
-      this._activeRequests++;
+      await this._acquire(isInteractive);
       Log.debug(
-        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}/${_maxConcurrent}, 后台: ${this._activeBackgroundRequests}, 交互: ${isInteractive})`,
+        `[请求] ${method} ${host}${path} (并发: ${this._activeRequests}, 后台: ${this._activeBackgroundRequests}, 交互: ${isInteractive})`,
       );
 
       try {
@@ -1003,10 +1034,7 @@
 
         return result;
       } finally {
-        this._activeRequests--;
-        if (!isInteractive) {
-          this._activeBackgroundRequests--;
-        }
+        this._release(isInteractive);
       }
     },
 
@@ -1350,6 +1378,17 @@
 
   // ==================== UI 渲染函数 ====================
   /**
+   * 判断站点今日是否已签到（对比 lastCheckinDate 与当天日期，避免跨日后误判）
+   */
+  function isCheckedInToday(data) {
+    if (data.checkedInToday !== true) return false;
+    if (!data.lastCheckinDate) return true; // 旧缓存无日期字段，兼容处理
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    return data.lastCheckinDate === today;
+  }
+
+  /**
    * 渲染卡片助手信息（带手动刷新按钮）
    * @param {HTMLElement} card - 卡片元素
    * @param {string} host - 主机名
@@ -1411,9 +1450,9 @@
       separator.textContent = "|";
       infoBar.appendChild(separator);
 
-      const checkinText = data.checkedInToday ? "已签到" : "未签到";
+      const checkinText = isCheckedInToday(data) ? "已签到" : "未签到";
       const checkinSpan = document.createElement("span");
-      checkinSpan.style.color = data.checkedInToday
+      checkinSpan.style.color = isCheckedInToday(data)
         ? "var(--ldoh-success)"
         : "var(--ldoh-warning)";
       checkinSpan.textContent = checkinText;
@@ -2706,10 +2745,13 @@
           let checkinClass = "na",
             checkinText = "─";
           if (siteData.checkinSupported !== false) {
-            if (siteData.checkedInToday === true) {
+            if (isCheckedInToday(siteData)) {
               checkinClass = "ok";
               checkinText = "已签到";
-            } else if (siteData.checkedInToday === false) {
+            } else if (
+              siteData.checkedInToday === false ||
+              siteData.lastCheckinDate
+            ) {
               checkinClass = "no";
               checkinText = "未签到";
             }
@@ -3049,6 +3091,31 @@
 
         Log.debug("[LDOH] MutationObserver 已启动");
         FloatingPanel.init();
+
+        // 自动定时刷新：每分钟检测一次是否有站点缓存已过期
+        setInterval(() => {
+          const settings = GM_getValue(CONFIG.SETTINGS_KEY, {});
+          const intervalMs =
+            (settings.interval || CONFIG.DEFAULT_INTERVAL) * 60 * 1000;
+          const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+          const now = Date.now();
+          Object.entries(allData).forEach(([h, d]) => {
+            if (
+              d.userId &&
+              !Utils.isBlacklisted(h) &&
+              d.ts &&
+              now - d.ts >= intervalMs
+            ) {
+              API.updateSiteStatus(h, d.userId, false)
+                .then((fresh) => {
+                  const card = findCardByHost(h);
+                  if (card) renderHelper(card, h, fresh);
+                  FloatingPanel.refresh();
+                })
+                .catch((e) => Log.error(`[自动刷新] ${h}`, e));
+            }
+          });
+        }, 60_000);
       } else {
         // 公益站：检测是否为 New API 站点
         Log.info("环境: 公益站");
