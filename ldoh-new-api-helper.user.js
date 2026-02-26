@@ -21,6 +21,9 @@
 /**
  * 版本更新日志
  *
+ * v1.0.16 (2026-02-26)
+ * - feat: 更新 Token 缓存有效期至 12 小时，优化签到逻辑
+ *
  * v1.0.15 (2026-02-26)
  * - feat：监控 LDOH /api/sites 自动同步白名单、站点名及签到支持状态，无需手动刷新
  * - feat：公益站签到成功后即时同步数据；跨标签页实时更新悬浮按钮数字
@@ -120,7 +123,7 @@
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
     PORTAL_HOST: "ldoh.105117.xyz",
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
-    CHECKIN_TIMEOUT_MS: 15000, // 签到超时时间（毫秒）
+    TOKEN_TTL_MS: 12 * 60 * 60 * 1000, // Token 缓存有效期（12 小时）
     DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
     LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
     LOGIN_CHECK_MAX_ATTEMPTS: 10, // 登录检测最大尝试次数（5秒）
@@ -1061,9 +1064,13 @@
 
         Log.info(`[开始更新] ${host} (用户: ${userId}, 强制: ${force})`);
 
-        // 获取 token（如果没有）
-        if (!data.token) {
-          Log.debug(`[获取 Token] ${host}`);
+        // 获取 token（首次或超过 12 小时重新获取）
+        const tokenExpired =
+          data.token &&
+          (!data.tokenTs || Date.now() - data.tokenTs >= CONFIG.TOKEN_TTL_MS);
+        if (!data.token || tokenExpired) {
+          if (tokenExpired) Log.debug(`[Token 过期] ${host} - 重新获取`);
+          else Log.debug(`[获取 Token] ${host}`);
           const tokenRes = await this.request(
             "GET",
             host,
@@ -1074,6 +1081,7 @@
           Log.debug(`[Token 响应] ${host}`, tokenRes);
           if (tokenRes.success && tokenRes.data) {
             data.token = tokenRes.data;
+            data.tokenTs = Date.now();
             Log.success(`[Token 获取成功] ${host}`);
           } else {
             Log.error(`[Token 获取失败] ${host}`, tokenRes);
@@ -1138,10 +1146,11 @@
             );
           } else {
             Log.warn(
-              `[签到数据获取失败] ${host} - 可能不支持签到功能`,
+              `[签到数据获取失败] ${host} - 接口请求失败，保留现有签到支持状态`,
               checkinRes,
             );
-            checkinSupported = false;
+            // 不强制写 false：请求失败可能是网络/CF 等临时问题，保留 LDOH 同步的值
+            checkinSupported = data.checkinSupported ?? true;
             checkedInToday = null;
           }
         }
@@ -1365,24 +1374,15 @@
           }
         }
 
-        // 创建带超时的请求
-        const timeoutPromise = new Promise((resolve) => {
-          setTimeout(() => {
-            resolve({ success: false, error: "签到超时（15秒）" });
-          }, CONFIG.CHECKIN_TIMEOUT_MS);
-        });
-
-        const requestPromise = this.request(
+        const res = await this.request(
           "POST",
           host,
           checkinPath,
           token,
           userId,
           null,
-          false,
+          true,
         );
-
-        const res = await Promise.race([requestPromise, timeoutPromise]);
 
         if (res.success) {
           const quotaAwarded = res.data?.quota_awarded || 0;
@@ -1395,7 +1395,7 @@
           // 标记为已签到状态，便于上层处理
           res.alreadyCheckedIn = true;
         } else {
-          Log.warn(`[签到失败] ${host}`, res);
+          Log.error(`[签到失败] ${host}`, res);
         }
 
         return res;
@@ -3577,7 +3577,8 @@
     const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
     const today = getTodayString();
     const sites = Object.entries(allData).filter(([host, data]) => {
-      if (!data.userId || !data.token || !data.checkinSupported) return false;
+      if (!data.userId || !data.token || data.checkinSupported === false)
+        return false;
       if (Utils.isCheckinSkipped(host)) return false;
       const lastCheckinDate = data.lastCheckinDate || "1970-01-01";
       return lastCheckinDate !== today || data.checkedInToday === false;
