@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.16
+// @version      1.0.17
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,12 @@
 
 /**
  * 版本更新日志
+ * v1.0.17 (2026-02-26)
+ * - refactor：DEFAULT_CHECKIN_SKIP 改为 Map（host → reason），支持内置跳过原因
+ * - fix：悬浮面板签到跳过按钮 hover 展示内置跳过原因；恢复签到二次确认中显示原因
+ * - fix：悬浮面板 refresh() 加防抖，有活跃弹窗时推迟刷新，关闭后补刷
+ * - fix：render() 保存/恢复滚动位置，避免刷新后回到顶部
+ * - refactor：删除 CF Turnstile 相关逻辑
  *
  * v1.0.16 (2026-02-26)
  * - feat: 更新 Token 缓存有效期至 12 小时，优化签到逻辑
@@ -112,11 +118,12 @@
       "windhub.cc", // 非 New API 站点
       "ai.qaq.al", // 非 New API 站点
     ],
-    DEFAULT_CHECKIN_SKIP: [
-      //   "justdoitme.me", // CF Turnstile 拦截
-      //   "api.67.si", // CF Turnstile 拦截
-      "anyrouter.top", // 登录自动签到
-    ],
+    DEFAULT_CHECKIN_SKIP: new Map([
+      ["justdoitme.me", "CF Turnstile 拦截"],
+      ["api.67.si", "CF Turnstile 拦截"],
+      ["runanytime.hxi.me", "CF Turnstile 拦截"],
+      ["anyrouter.top", "登录自动签到"],
+    ]),
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     DEFAULT_MAX_CONCURRENT: 15, // 默认最大总并发数
     DEFAULT_MAX_BACKGROUND: 10, // 默认最大后台并发数
@@ -451,9 +458,12 @@
   function _isInManagedList(n, builtinList, addedKey, removedKey) {
     const added = GM_getValue(addedKey, []);
     const removed = GM_getValue(removedKey, []);
-    return (
-      (builtinList.includes(n) && !removed.includes(n)) || added.includes(n)
-    );
+    const inBuiltin = Array.isArray(builtinList)
+      ? builtinList.includes(n)
+      : builtinList instanceof Map
+        ? builtinList.has(n)
+        : Object.prototype.hasOwnProperty.call(builtinList, n);
+    return (inBuiltin && !removed.includes(n)) || added.includes(n);
   }
 
   /**
@@ -461,8 +471,13 @@
    * @returns {boolean} true=已加入，false=已移出
    */
   function _toggleManagedList(n, builtinList, addedKey, removedKey) {
+    const inBuiltin = Array.isArray(builtinList)
+      ? builtinList.includes(n)
+      : builtinList instanceof Map
+        ? builtinList.has(n)
+        : Object.prototype.hasOwnProperty.call(builtinList, n);
     if (_isInManagedList(n, builtinList, addedKey, removedKey)) {
-      if (builtinList.includes(n)) {
+      if (inBuiltin) {
         const removed = GM_getValue(removedKey, []);
         if (!removed.includes(n)) {
           removed.push(n);
@@ -625,6 +640,15 @@
         CONFIG.BLACKLIST_KEY,
         CONFIG.BLACKLIST_REMOVED_KEY,
       );
+    },
+
+    /**
+     * 获取站点在内置签到跳过列表中的原因（不在则返回 null）
+     */
+    getBuiltinCheckinSkipReason(host) {
+      const n = this.normalizeHost(host);
+      const list = CONFIG.DEFAULT_CHECKIN_SKIP;
+      return list instanceof Map ? (list.get(n) ?? null) : (list[n] ?? null);
     },
 
     /**
@@ -796,17 +820,6 @@
         }
 
         if (hasUserData) {
-          // 趁 status 已解析，顺带持久化 Turnstile 配置，避免 LDOH 侧额外请求 /api/status
-          try {
-            const status = JSON.parse(localStorage.getItem("status") || "{}");
-            const existing = Utils.getSiteData(normalizedHost);
-            if (existing.turnstileCheck === undefined) {
-              Utils.saveSiteData(normalizedHost, {
-                turnstileCheck: status.turnstile_check === true,
-                turnstileSiteKey: status.turnstile_site_key || null,
-              });
-            }
-          } catch (_) {}
           Log.debug(`[站点识别] ${host} - 检测到用户数据，判定为 New API 站点`);
           return true;
         }
@@ -1013,28 +1026,6 @@
     },
 
     /**
-     * 获取站点配置（/api/status），用于读取 CF Turnstile 配置
-     * @param {string} host - 主机名
-     * @returns {Promise<object>} 响应数据 { success, data: { turnstile_check, turnstile_site_key, ... } }
-     */
-    async fetchSiteConfig(host) {
-      try {
-        return await this.request(
-          "GET",
-          host,
-          "/api/status",
-          null,
-          null,
-          null,
-          false,
-        );
-      } catch (e) {
-        Log.debug(`[站点配置] ${host} - 请求失败`, e);
-        return { success: false };
-      }
-    },
-
-    /**
      * 更新站点状态（优化数据一致性和登录检测）
      * @param {string} host - 主机名
      * @param {string} userId - 用户 ID
@@ -1161,16 +1152,6 @@
         data.checkinSupported = checkinSupported;
         data.lastCheckinDate = lastCheckinDate;
         data.userId = userId;
-
-        // 获取站点配置（CF Turnstile 等）：优先使用已缓存的值，否则请求 /api/status
-        if (data.turnstileCheck === undefined) {
-          const configRes = await this.fetchSiteConfig(host);
-          if (configRes.success && configRes.data) {
-            data.turnstileCheck = configRes.data.turnstile_check === true;
-            data.turnstileSiteKey = configRes.data.turnstile_site_key || null;
-            Log.debug(`[站点配置] ${host} - turnstile: ${data.turnstileCheck}`);
-          }
-        }
 
         Utils.saveSiteData(host, data);
 
@@ -1355,29 +1336,10 @@
       try {
         Log.debug(`[签到] ${host}`);
 
-        // 若站点需要 CF Turnstile 校验，尝试获取 token（失败则降级无 token 请求）
-        let checkinPath = "/api/user/checkin";
-        const siteData = Utils.getSiteData(host);
-        if (siteData.turnstileCheck && siteData.turnstileSiteKey) {
-          try {
-            Log.debug(`[签到] ${host} - 需要 CF Turnstile 校验`);
-            const turnstileToken = await Turnstile.getToken(
-              siteData.turnstileSiteKey,
-            );
-            checkinPath = `/api/user/checkin?turnstile=${encodeURIComponent(turnstileToken)}`;
-            Log.success(`[签到] ${host} - Turnstile token 获取成功`);
-          } catch (e) {
-            Log.warn(
-              `[签到] ${host} - Turnstile 获取失败，降级为无 token 请求`,
-              e,
-            );
-          }
-        }
-
         const res = await this.request(
           "POST",
           host,
-          checkinPath,
+          "/api/user/checkin",
           token,
           userId,
           null,
@@ -1403,76 +1365,6 @@
         Log.error(`[签到异常] ${host}`, e);
         return { success: false, error: "签到异常" };
       }
-    },
-  };
-
-  // ==================== CF Turnstile 模块 ====================
-  /**
-   * 在当前页面上获取 Cloudflare Turnstile 不可见校验 token。
-   * 注意：Turnstile sitekey 与域名绑定，仅当脚本运行在目标站点时有效。
-   * 从 LDOH 门户跨域调用时 token 获取会失败，checkin 将降级为无 token 请求。
-   */
-  const Turnstile = {
-    _container: null,
-
-    /** 确保 turnstile 脚本已加载 */
-    async _ensureLoaded() {
-      if (window.turnstile) return;
-      await new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src =
-          "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-        script.onload = resolve;
-        script.onerror = () => reject(new Error("Turnstile 脚本加载失败"));
-        document.head.appendChild(script);
-        setTimeout(() => reject(new Error("Turnstile 脚本加载超时")), 10000);
-      });
-    },
-
-    /**
-     * 获取 Turnstile invisible challenge token
-     * @param {string} siteKey - Turnstile site key
-     * @returns {Promise<string>} token
-     */
-    async getToken(siteKey) {
-      await this._ensureLoaded();
-      return new Promise((resolve, reject) => {
-        if (!this._container) {
-          this._container = document.createElement("div");
-          this._container.style.cssText =
-            "position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;";
-          document.body.appendChild(this._container);
-        }
-
-        let widgetId;
-        const timer = setTimeout(() => {
-          if (widgetId !== undefined) {
-            try {
-              window.turnstile.remove(widgetId);
-            } catch (_) {}
-          }
-          reject(new Error("Turnstile 校验超时"));
-        }, 30000);
-
-        widgetId = window.turnstile.render(this._container, {
-          sitekey: siteKey,
-          size: "invisible",
-          callback: (token) => {
-            clearTimeout(timer);
-            try {
-              window.turnstile.remove(widgetId);
-            } catch (_) {}
-            resolve(token);
-          },
-          "error-callback": () => {
-            clearTimeout(timer);
-            try {
-              window.turnstile.remove(widgetId);
-            } catch (_) {}
-            reject(new Error("Turnstile 校验失败"));
-          },
-        });
-      });
     },
   };
 
@@ -2117,7 +2009,7 @@
       pop.id = "ldoh-confirm-pop";
       pop.className = "ldoh-confirm-pop";
       pop.innerHTML = `
-        <span>${Utils.escapeHtml(text)}</span>
+        <span style="white-space:pre-line">${Utils.escapeHtml(text)}</span>
         <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
         <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
       `;
@@ -2210,6 +2102,9 @@
     _intervalOutsideHandler: null,
     _concurrencyPop: null,
     _concurrencyOutsideHandler: null,
+    _pendingRefresh: false,
+    _refreshTimer: null,
+    _rendering: false,
 
     init() {
       if (document.getElementById("ldoh-fab")) return;
@@ -2290,7 +2185,20 @@
 
     refresh() {
       this._updateBadge();
-      if (this._isOpen) this.render();
+      if (!this._isOpen) return;
+      // 有活跃交互弹窗时推迟刷新，避免打断用户操作
+      if (
+        this._confirmPop ||
+        this._settingsPop ||
+        this._intervalPop ||
+        this._concurrencyPop
+      ) {
+        this._pendingRefresh = true;
+        return;
+      }
+      // 防抖：多次连续调用（如批量刷新每站触发一次）合并为一次渲染
+      clearTimeout(this._refreshTimer);
+      this._refreshTimer = setTimeout(() => this.render(), 150);
     },
 
     _updateBadge() {
@@ -2314,6 +2222,7 @@
       } else {
         document.getElementById("ldoh-confirm-pop")?.remove();
       }
+      if (!this._rendering) this._flushPendingRefresh();
     },
 
     _showConfirmPopover(anchorEl, text, onConfirm) {
@@ -2327,7 +2236,7 @@
       pop.id = "ldoh-confirm-pop";
       pop.className = "ldoh-confirm-pop";
       pop.innerHTML = `
-        <span>${Utils.escapeHtml(text)}</span>
+        <span style="white-space:pre-line">${Utils.escapeHtml(text)}</span>
         <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
         <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
       `;
@@ -2380,6 +2289,7 @@
       } else {
         document.getElementById("ldoh-interval-pop")?.remove();
       }
+      if (!this._rendering) this._flushPendingRefresh();
     },
 
     _removeConcurrencyPopover() {
@@ -2393,6 +2303,7 @@
       } else {
         document.getElementById("ldoh-concurrency-pop")?.remove();
       }
+      if (!this._rendering) this._flushPendingRefresh();
     },
 
     _showConcurrencyPopover(anchorEl) {
@@ -2508,6 +2419,22 @@
         this._settingsPop = null;
       } else {
         document.getElementById("ldoh-settings-pop")?.remove();
+      }
+      if (!this._rendering) this._flushPendingRefresh();
+    },
+
+    /** 若有待刷新且当前无活跃弹窗，立即执行渲染 */
+    _flushPendingRefresh() {
+      if (
+        this._pendingRefresh &&
+        this._isOpen &&
+        !this._confirmPop &&
+        !this._settingsPop &&
+        !this._intervalPop &&
+        !this._concurrencyPop
+      ) {
+        this._pendingRefresh = false;
+        this.render();
       }
     },
 
@@ -2756,6 +2683,10 @@
 
     render() {
       if (!this._panel) return;
+      this._rendering = true;
+      const existingBody = this._panel.querySelector(".ldoh-panel-body");
+      const savedScroll = existingBody ? existingBody.scrollTop : 0;
+
       this._removeIntervalPopover();
       this._removeSettingsMenu();
       this._removeConfirmPopover();
@@ -2777,6 +2708,8 @@
       const body = this._buildBody(sorted);
       this._panel.appendChild(body);
       bindSearch(body);
+      body.scrollTop = savedScroll;
+      this._rendering = false;
     },
 
     /** 构建面板头部（标题、总额、操作按钮） */
@@ -3054,13 +2987,15 @@
       // 签到黑名单按钮（绿=参与签到，灰=跳过签到）
       const isSkipped = Utils.isCheckinSkipped(host);
       const checkinNotSupported = siteData.checkinSupported === false;
+      const builtinSkipReason = Utils.getBuiltinCheckinSkipReason(host);
+
       const skipCheckinBtn = document.createElement("div");
       skipCheckinBtn.className = "ldoh-btn";
       skipCheckinBtn.title = checkinNotSupported
         ? "LDOH 标记该站点不支持签到，如有变更请刷新页面同步"
         : isSkipped
-          ? "已跳过签到（点击恢复）"
-          : "参与签到（点击跳过）";
+          ? "跳过签到（点击恢复）"
+          : "自动签到（点击跳过）";
       skipCheckinBtn.style.color =
         checkinNotSupported || isSkipped ? "#9ca3af" : "var(--ldoh-success)";
       if (checkinNotSupported) skipCheckinBtn.style.cursor = "default";
@@ -3069,7 +3004,7 @@
         skipCheckinBtn.onclick = (e) => {
           e.stopPropagation();
           const confirmText = isSkipped
-            ? `恢复 ${host} 自动签到？`
+            ? `恢复 ${host} 自动签到？${builtinSkipReason ? `\n（跳过原因：${builtinSkipReason}）` : ""}`
             : `跳过 ${host} 自动签到？`;
           this._showConfirmPopover(skipCheckinBtn, confirmText, () => {
             const added = Utils.toggleCheckinSkip(host);
