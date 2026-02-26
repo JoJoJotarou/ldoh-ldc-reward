@@ -108,7 +108,6 @@
       "demo.voapi.top", // 非 New API 站点
       "windhub.cc", // 非 New API 站点
       "ai.qaq.al", // 非 New API 站点
-      "agentrouter.org", // CF 拦截
     ],
     DEFAULT_CHECKIN_SKIP: [
       //   "justdoitme.me", // CF Turnstile 拦截
