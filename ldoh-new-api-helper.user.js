@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.17
+// @version      1.0.18
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,12 @@
 
 /**
  * 版本更新日志
+ * v1.0.18 (2026-02-26)
+ * - fix：normalizeHost 不再去除 www. 前缀，避免 www 站点 key 错误
+ * - fix：自动签到成功后同步更新页面卡片签到状态
+ * - fix：悬浮面板与卡片签到状态逻辑对齐，API 失败时均不显示状态
+ * - feat：悬浮面板站点名下方小字显示完整地址（https://host）
+ *
  * v1.0.17 (2026-02-26)
  * - refactor：DEFAULT_CHECKIN_SKIP 改为 Map（host → reason），支持内置跳过原因
  * - fix：悬浮面板签到跳过按钮 hover 展示内置跳过原因；恢复签到二次确认中显示原因
@@ -114,6 +120,7 @@
     CHECKIN_SKIP_REMOVED_KEY: "ldoh_checkin_skip_removed", // 用户移除的内置签到跳过列表
     BLACKLIST: [
       "elysiver.h-e.top", // CF 拦截
+      "anthorpic.us.ci", // CF 拦截
       "demo.voapi.top", // 非 New API 站点
       "windhub.cc", // 非 New API 站点
       "ai.qaq.al", // 非 New API 站点
@@ -123,6 +130,7 @@
       ["api.67.si", "CF Turnstile 拦截"],
       ["runanytime.hxi.me", "CF Turnstile 拦截"],
       ["anyrouter.top", "登录自动签到"],
+      ["x666.me", "站外签到"],
     ]),
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     DEFAULT_MAX_CONCURRENT: 15, // 默认最大总并发数
@@ -364,6 +372,15 @@
     .ldoh-panel-name {
       font-weight: 600; color: var(--ldoh-text);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      display: flex; flex-direction: column; gap: 1px; min-width: 0;
+    }
+    .ldoh-panel-name-main {
+      font-weight: 600; color: var(--ldoh-text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .ldoh-panel-name-host {
+      font-size: 10px; font-weight: 400; color: var(--ldoh-text-light);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .ldoh-panel-checkin {
       font-size: 10px; padding: 2px 5px; border-radius: 8px; font-weight: 600; text-align: center;
@@ -580,8 +597,7 @@
       }
       return host
         .toLowerCase()
-        .split(":")[0]
-        .replace(/^www\./, "");
+        .split(":")[0];
     },
 
     /**
@@ -1435,18 +1451,24 @@
 
     // 只有支持签到的站点才显示签到状态
     if (data.checkinSupported !== false) {
-      const separator = document.createElement("span");
-      separator.style.opacity = "0.5";
-      separator.textContent = "|";
-      infoBar.appendChild(separator);
+      const knownStatus =
+        isCheckedInToday(data) ||
+        data.checkedInToday === false ||
+        data.lastCheckinDate;
+      if (knownStatus) {
+        const separator = document.createElement("span");
+        separator.style.opacity = "0.5";
+        separator.textContent = "|";
+        infoBar.appendChild(separator);
 
-      const checkinText = isCheckedInToday(data) ? "已签到" : "未签到";
-      const checkinSpan = document.createElement("span");
-      checkinSpan.style.color = isCheckedInToday(data)
-        ? "var(--ldoh-success)"
-        : "var(--ldoh-warning)";
-      checkinSpan.textContent = checkinText;
-      infoBar.appendChild(checkinSpan);
+        const checkinText = isCheckedInToday(data) ? "已签到" : "未签到";
+        const checkinSpan = document.createElement("span");
+        checkinSpan.style.color = isCheckedInToday(data)
+          ? "var(--ldoh-success)"
+          : "var(--ldoh-warning)";
+        checkinSpan.textContent = checkinText;
+        infoBar.appendChild(checkinSpan);
+      }
     }
 
     container.appendChild(infoBar);
@@ -2808,7 +2830,7 @@
       searchBar.innerHTML = `
         <div class="ldoh-panel-search-wrap">
           <svg class="ldoh-panel-search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input class="ldoh-panel-search-input" placeholder="搜索站点名称..." value="${Utils.escapeHtml(this._searchQuery)}">
+          <input class="ldoh-panel-search-input" placeholder="搜索站点名称/地址..." value="${Utils.escapeHtml(this._searchQuery)}">
         </div>
       `;
 
@@ -2886,7 +2908,18 @@
       const nameEl = document.createElement("div");
       nameEl.className = "ldoh-panel-name";
       nameEl.title = host;
-      nameEl.textContent = displayName;
+
+      const nameMain = document.createElement("span");
+      nameMain.className = "ldoh-panel-name-main";
+      nameMain.textContent = displayName;
+      nameEl.appendChild(nameMain);
+
+      if (siteData.siteName) {
+        const nameHost = document.createElement("span");
+        nameHost.className = "ldoh-panel-name-host";
+        nameHost.textContent = `https://${host}`;
+        nameEl.appendChild(nameHost);
+      }
 
       const checkinEl = document.createElement("div");
       checkinEl.className = `ldoh-panel-checkin ${checkinClass}`;
@@ -3570,6 +3603,8 @@
             siteData.quota = (siteData.quota || 0) + result.data.quota_awarded;
           }
           Utils.saveSiteData(host, siteData);
+          const card = findCardByHost(host);
+          if (card) renderHelper(card, host, siteData);
           return true;
         } else if (result.alreadyCheckedIn) {
           siteResults.set(host, "already");
@@ -3577,6 +3612,8 @@
           siteData.lastCheckinDate = today;
           siteData.checkedInToday = true;
           Utils.saveSiteData(host, siteData);
+          const card = findCardByHost(host);
+          if (card) renderHelper(card, host, siteData);
           return true;
         } else if (result.error === "签到超时（15秒）") {
           siteResults.set(host, "timeout");
