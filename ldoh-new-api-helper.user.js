@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.14
+// @version      1.0.15
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -10,6 +10,9 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
+// @grant        unsafeWindow
 // @connect      *
 // @run-at       document-idle
 // @license      MIT
@@ -17,6 +20,15 @@
 
 /**
  * 版本更新日志
+ *
+ * v1.0.15 (2026-02-26)
+ * - feat：监控 LDOH /api/sites 自动同步白名单、站点名及签到支持状态，无需手动刷新
+ * - feat：公益站签到成功后即时同步数据；跨标签页实时更新悬浮按钮数字
+ * - feat：支持 CF Turnstile 验证码签到（invisible 模式），站点配置自动缓存
+ * - feat：不支持签到的站点按钮置灰禁用，hover 显示原因说明
+ * - fix：密钥创建后原地刷新列表及数量角标；修复二次创建按钮失效的 bug
+ * - refactor：runPortalMode 仅负责 UI 注入，数据刷新改由定时器/手动触发；页面加载立即检查过期缓存
+ * - refactor：登录检测改为严格互斥分支，减少冗余监听器注册
  *
  * v1.0.14 (2026-02-26)
  * - fix：签到状态渲染改为对比 lastCheckinDate 与当天日期，避免跨日后仍显示「已签到」
@@ -96,22 +108,25 @@
       "demo.voapi.top", // 非 New API 站点
       "windhub.cc", // 非 New API 站点
       "ai.qaq.al", // 非 New API 站点
-      "anyrouter.top", // CF 拦截
       "agentrouter.org", // CF 拦截
     ],
     DEFAULT_CHECKIN_SKIP: [
-      "justdoitme.me", // CF Turnstile 拦截
-      "api.67.si", // CF Turnstile 拦截
+      //   "justdoitme.me", // CF Turnstile 拦截
+      //   "api.67.si", // CF Turnstile 拦截
       "anyrouter.top", // 登录自动签到
     ],
     DEFAULT_INTERVAL: 60, // 默认 60 分钟
     DEFAULT_MAX_CONCURRENT: 15, // 默认最大总并发数
     DEFAULT_MAX_BACKGROUND: 10, // 默认最大后台并发数
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
+    PORTAL_HOST: "ldoh.105117.xyz",
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
+    CHECKIN_TIMEOUT_MS: 15000, // 签到超时时间（毫秒）
     DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
     LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
     LOGIN_CHECK_MAX_ATTEMPTS: 10, // 登录检测最大尝试次数（5秒）
+    ANIMATION_FAST_MS: 200, // 快速动画时长（毫秒）
+    ANIMATION_NORMAL_MS: 300, // 普通动画时长（毫秒）
     DOM: {
       CARD_SELECTOR: ".rounded-xl.shadow.group.relative",
       HELPER_CONTAINER_CLASS: "ldoh-helper-container",
@@ -145,6 +160,24 @@
     debug: (msg, ...args) =>
       Log._printDebug("debug", msg, "#fff", "#8b5cf6", ...args),
   };
+
+  // ==================== 日期工具 ====================
+  /**
+   * 获取今天的日期字符串，格式 "YYYY-MM-DD"
+   * @returns {string}
+   */
+  function getTodayString() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  }
+
+  /**
+   * 获取当前月份字符串，格式 "YYYY-MM"
+   * @returns {string}
+   */
+  function getCurrentMonthString() {
+    return getTodayString().slice(0, 7);
+  }
 
   // ==================== 样式定义 ====================
   const STYLES = `
@@ -409,6 +442,56 @@
     }
   `;
 
+  // ==================== 托管列表辅助 ====================
+  /**
+   * 判断规范化 host 是否在托管列表中（builtinList ∪ added \ removed）
+   */
+  function _isInManagedList(n, builtinList, addedKey, removedKey) {
+    const added = GM_getValue(addedKey, []);
+    const removed = GM_getValue(removedKey, []);
+    return (
+      (builtinList.includes(n) && !removed.includes(n)) || added.includes(n)
+    );
+  }
+
+  /**
+   * 切换规范化 host 在托管列表中的状态
+   * @returns {boolean} true=已加入，false=已移出
+   */
+  function _toggleManagedList(n, builtinList, addedKey, removedKey) {
+    if (_isInManagedList(n, builtinList, addedKey, removedKey)) {
+      if (builtinList.includes(n)) {
+        const removed = GM_getValue(removedKey, []);
+        if (!removed.includes(n)) {
+          removed.push(n);
+          GM_setValue(removedKey, removed);
+        }
+      } else {
+        const added = GM_getValue(addedKey, []);
+        const idx = added.indexOf(n);
+        if (idx >= 0) {
+          added.splice(idx, 1);
+          GM_setValue(addedKey, added);
+        }
+      }
+      return false;
+    } else {
+      const removed = GM_getValue(removedKey, []);
+      const ridx = removed.indexOf(n);
+      if (ridx >= 0) {
+        removed.splice(ridx, 1);
+        GM_setValue(removedKey, removed);
+      } else {
+        const added = GM_getValue(addedKey, []);
+        if (!added.includes(n)) {
+          added.push(n);
+          GM_setValue(addedKey, added);
+        }
+      }
+      return true;
+    }
+  }
+
   // ==================== 工具函数 ====================
   const Utils = {
     /**
@@ -444,11 +527,8 @@
         }
 
         if (user.id) {
-          const userId = user.id;
-          if (userId) {
-            Log.debug(`从 localStorage 获取到用户 ID: ${userId}`);
-            return userId;
-          }
+          Log.debug(`从 localStorage 获取到用户 ID: ${user.id}`);
+          return user.id;
         }
 
         Log.warn("无法从 user 数据中提取用户 ID", user);
@@ -521,125 +601,55 @@
     },
 
     /**
-     * 获取用户自定义站点黑名单
-     */
-    getBlacklist() {
-      return GM_getValue(CONFIG.BLACKLIST_KEY, []);
-    },
-
-    /**
-     * 判断站点是否在黑名单中
-     * 有效黑名单 = (内置 ∪ 用户追加) \ 用户移除
+     * 判断站点是否在黑名单中（内置 ∪ 用户追加 \ 用户移除）
      */
     isBlacklisted(host) {
-      const n = this.normalizeHost(host);
-      const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
-      const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
-      return (
-        (CONFIG.BLACKLIST.includes(n) && !removed.includes(n)) ||
-        added.includes(n)
+      return _isInManagedList(
+        this.normalizeHost(host),
+        CONFIG.BLACKLIST,
+        CONFIG.BLACKLIST_KEY,
+        CONFIG.BLACKLIST_REMOVED_KEY,
       );
     },
 
     /**
-     * 切换站点在黑名单中的状态（内置条目同样可被移除）
+     * 切换站点在黑名单中的状态
      * @returns {boolean} true=已加入黑名单，false=已移出
      */
     toggleBlacklist(host) {
-      const n = this.normalizeHost(host);
-      if (this.isBlacklisted(n)) {
-        // 移出：内置 → 加入 removed 列表；用户追加 → 从 added 列表移除
-        if (CONFIG.BLACKLIST.includes(n)) {
-          const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
-          if (!removed.includes(n)) {
-            removed.push(n);
-            GM_setValue(CONFIG.BLACKLIST_REMOVED_KEY, removed);
-          }
-        } else {
-          const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
-          const idx = added.indexOf(n);
-          if (idx >= 0) {
-            added.splice(idx, 1);
-            GM_setValue(CONFIG.BLACKLIST_KEY, added);
-          }
-        }
-        return false;
-      } else {
-        // 加入：若曾被用户移除过内置条目 → 从 removed 列表删除；否则加入 added 列表
-        const removed = GM_getValue(CONFIG.BLACKLIST_REMOVED_KEY, []);
-        const ridx = removed.indexOf(n);
-        if (ridx >= 0) {
-          removed.splice(ridx, 1);
-          GM_setValue(CONFIG.BLACKLIST_REMOVED_KEY, removed);
-        } else {
-          const added = GM_getValue(CONFIG.BLACKLIST_KEY, []);
-          if (!added.includes(n)) {
-            added.push(n);
-            GM_setValue(CONFIG.BLACKLIST_KEY, added);
-          }
-        }
-        return true;
-      }
-    },
-
-    /**
-     * 获取用户自定义签到跳过列表
-     */
-    getCheckinSkip() {
-      return GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
-    },
-
-    /**
-     * 判断站点是否跳过自动签到
-     * 有效列表 = (内置 ∪ 用户追加) \ 用户移除
-     */
-    isCheckinSkipped(host) {
-      const n = this.normalizeHost(host);
-      const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
-      const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
-      return (
-        (CONFIG.DEFAULT_CHECKIN_SKIP.includes(n) && !removed.includes(n)) ||
-        added.includes(n)
+      return _toggleManagedList(
+        this.normalizeHost(host),
+        CONFIG.BLACKLIST,
+        CONFIG.BLACKLIST_KEY,
+        CONFIG.BLACKLIST_REMOVED_KEY,
       );
     },
 
     /**
-     * 切换站点在签到跳过列表中的状态（内置条目同样可被移除）
+     * 判断站点是否跳过自动签到（内置 ∪ 用户追加 \ 用户移除）
+     */
+    isCheckinSkipped(host) {
+      const n = this.normalizeHost(host);
+      if (this.getSiteData(n).checkinSupported === false) return true;
+      return _isInManagedList(
+        n,
+        CONFIG.DEFAULT_CHECKIN_SKIP,
+        CONFIG.CHECKIN_SKIP_KEY,
+        CONFIG.CHECKIN_SKIP_REMOVED_KEY,
+      );
+    },
+
+    /**
+     * 切换站点在签到跳过列表中的状态
      * @returns {boolean} true=已加入跳过列表，false=已移出
      */
     toggleCheckinSkip(host) {
-      const n = this.normalizeHost(host);
-      if (this.isCheckinSkipped(n)) {
-        if (CONFIG.DEFAULT_CHECKIN_SKIP.includes(n)) {
-          const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
-          if (!removed.includes(n)) {
-            removed.push(n);
-            GM_setValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, removed);
-          }
-        } else {
-          const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
-          const idx = added.indexOf(n);
-          if (idx >= 0) {
-            added.splice(idx, 1);
-            GM_setValue(CONFIG.CHECKIN_SKIP_KEY, added);
-          }
-        }
-        return false;
-      } else {
-        const removed = GM_getValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, []);
-        const ridx = removed.indexOf(n);
-        if (ridx >= 0) {
-          removed.splice(ridx, 1);
-          GM_setValue(CONFIG.CHECKIN_SKIP_REMOVED_KEY, removed);
-        } else {
-          const added = GM_getValue(CONFIG.CHECKIN_SKIP_KEY, []);
-          if (!added.includes(n)) {
-            added.push(n);
-            GM_setValue(CONFIG.CHECKIN_SKIP_KEY, added);
-          }
-        }
-        return true;
-      }
+      return _toggleManagedList(
+        this.normalizeHost(host),
+        CONFIG.DEFAULT_CHECKIN_SKIP,
+        CONFIG.CHECKIN_SKIP_KEY,
+        CONFIG.CHECKIN_SKIP_REMOVED_KEY,
+      );
     },
 
     /**
@@ -737,12 +747,12 @@
      * @param {number} retryCount - 重试次数（用于 OAuth 场景）
      * @returns {Promise<boolean>} 是否为 New API 站点
      */
-    async isNewApiSite(retryCount = 3) {
+    async isNewApiSite(retryCount = 5) {
       try {
         const host = window.location.hostname;
 
         // LDOH 站点直接返回 true
-        if (host === "ldoh.105117.xyz") {
+        if (host === CONFIG.PORTAL_HOST) {
           return true;
         }
 
@@ -756,16 +766,18 @@
 
         // 第二步：检查是否在 LDOH 站点白名单中
         const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
+        const inWhitelist = whitelist.includes(normalizedHost);
 
-        if (!whitelist.includes(normalizedHost)) {
+        if (!inWhitelist) {
           Log.debug(`[站点识别] ${host} - 不在 LDOH 站点白名单中，跳过`);
           return false;
         }
 
-        Log.debug(
-          `[站点识别] ${host} - 在 LDOH 白名单中，继续检测 New API 特征`,
-        );
-
+        if (retryCount > 0) {
+          Log.debug(
+            `[站点识别] ${host} - 在 LDOH 白名单中，继续检测 New API 特征`,
+          );
+        }
         // 第三步：检查是否符合 New API 站点特征
         // 检查 localStorage 中是否有 user 数据（已登录过）
         let hasUserData = !!localStorage.getItem("user");
@@ -773,32 +785,28 @@
         // OAuth 场景：如果没有 user 数据，等待一会再检查
         if (!hasUserData && retryCount > 0) {
           Log.debug(
-            `[站点识别] ${host} - 暂无用户数据，等待 ${retryCount} 次重试...`,
+            `[站点识别] ${host} - 暂无用户数据，${
+              retryCount === 1 ? "结束" : "等待"
+            }重试...`,
           );
           await new Promise((resolve) => setTimeout(resolve, 500));
           return this.isNewApiSite(retryCount - 1);
         }
 
         if (hasUserData) {
+          // 趁 status 已解析，顺带持久化 Turnstile 配置，避免 LDOH 侧额外请求 /api/status
+          try {
+            const status = JSON.parse(localStorage.getItem("status") || "{}");
+            const existing = Utils.getSiteData(normalizedHost);
+            if (existing.turnstileCheck === undefined) {
+              Utils.saveSiteData(normalizedHost, {
+                turnstileCheck: status.turnstile_check === true,
+                turnstileSiteKey: status.turnstile_site_key || null,
+              });
+            }
+          } catch (_) {}
           Log.debug(`[站点识别] ${host} - 检测到用户数据，判定为 New API 站点`);
           return true;
-        }
-
-        // 检查 API 端点是否可访问
-        Log.debug(`[站点识别] ${host} - 检查 API 端点...`);
-        try {
-          const response = await fetch("/api/status", {
-            method: "GET",
-            timeout: 3000,
-          });
-          if (response.ok && response.data?.data?._qn === "new-api") {
-            Log.debug(
-              `[站点识别] ${host} - API 端点可访问（_qn=new-api），判定为 New API 站点`,
-            );
-            return true;
-          }
-        } catch (e) {
-          Log.debug(`[站点识别] ${host} - API 端点不可访问`);
         }
 
         Log.debug(`[站点识别] ${host} - 未识别为 New API 站点`);
@@ -806,45 +814,6 @@
       } catch (e) {
         Log.error("[站点识别] 检测失败", e);
         return false;
-      }
-    },
-
-    /**
-     * 更新 LDOH 站点白名单（从卡片中提取所有站点域名）
-     */
-    updateSiteWhitelist() {
-      try {
-        const cards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
-        const hosts = new Set();
-
-        cards.forEach((card) => {
-          const links = Array.from(card.querySelectorAll("a"));
-          const siteLink =
-            links.find(
-              (a) => a.href.startsWith("http") && !a.href.includes("linux.do"),
-            ) || links[0];
-
-          if (siteLink) {
-            try {
-              const host = new URL(siteLink.href).hostname;
-              const normalizedHost = this.normalizeHost(host);
-              // 过滤掉黑名单中的站点
-              if (normalizedHost && !Utils.isBlacklisted(normalizedHost)) {
-                hosts.add(normalizedHost);
-              }
-            } catch (e) {
-              // 忽略无效 URL
-            }
-          }
-        });
-
-        const whitelist = Array.from(hosts);
-        GM_setValue(CONFIG.WHITELIST_KEY, whitelist);
-        Log.debug(`[白名单更新] 共 ${whitelist.length} 个站点`, whitelist);
-        return whitelist;
-      } catch (e) {
-        Log.error("[白名单更新] 更新失败", e);
-        return [];
       }
     },
 
@@ -988,6 +957,9 @@
             url: `https://${host}${path}`,
             headers: {
               "Content-Type": "application/json",
+              "User-Agent":
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
+              Referer: `https://${host}/`,
               ...(token ? { Authorization: `Bearer ${token}` } : {}),
               ...(userId ? { "New-Api-User": userId } : {}),
             },
@@ -1039,6 +1011,28 @@
     },
 
     /**
+     * 获取站点配置（/api/status），用于读取 CF Turnstile 配置
+     * @param {string} host - 主机名
+     * @returns {Promise<object>} 响应数据 { success, data: { turnstile_check, turnstile_site_key, ... } }
+     */
+    async fetchSiteConfig(host) {
+      try {
+        return await this.request(
+          "GET",
+          host,
+          "/api/status",
+          null,
+          null,
+          null,
+          false,
+        );
+      } catch (e) {
+        Log.debug(`[站点配置] ${host} - 请求失败`, e);
+        return { success: false };
+      }
+    },
+
+    /**
      * 更新站点状态（优化数据一致性和登录检测）
      * @param {string} host - 主机名
      * @param {string} userId - 用户 ID
@@ -1078,6 +1072,7 @@
             null,
             userId,
           );
+          Log.debug(`[Token 响应] ${host}`, tokenRes);
           if (tokenRes.success && tokenRes.data) {
             data.token = tokenRes.data;
             Log.success(`[Token 获取成功] ${host}`);
@@ -1106,48 +1101,50 @@
         }
 
         // 第二步：从签到接口获取签到状态
-        const now = new Date();
-        const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-        const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-        Log.debug(`[获取签到数据] ${host} - 月份: ${monthStr}`);
-
-        const checkinRes = await this.request(
-          "GET",
-          host,
-          `/api/user/checkin?month=${monthStr}`,
-          data.token,
-          userId,
-        );
+        const monthStr = getCurrentMonthString();
+        const todayStr = getTodayString();
 
         let checkedInToday = false;
-        let checkinSupported = true; // 是否支持签到
-        let lastCheckinDate = data.lastCheckinDate || null; // 保留原有的签到日期
+        let checkinSupported = true;
+        let lastCheckinDate = data.lastCheckinDate || null;
 
-        if (checkinRes.success && checkinRes.data) {
-          checkedInToday = !!checkinRes.data?.stats?.checked_in_today;
-
-          // 特殊处理：wzw.pp.ua (WONG 公益站)
-          if (host === "wzw.pp.ua") {
-            Log.debug(`[签到数据] ${host} - 特殊站点`);
-            checkedInToday = !!checkinRes.data?.checked_in;
-          }
-
-          // 如果已签到，更新签到日期为今天
-          if (checkedInToday) {
-            lastCheckinDate = todayStr;
-          }
-
-          Log.debug(
-            `[签到数据] ${host} - 已签到: ${checkedInToday}, 签到日期: ${lastCheckinDate}`,
-          );
-        } else {
-          // 无法调用 checkin 接口：旧版本或站外签到
-          Log.warn(
-            `[签到数据获取失败] ${host} - 可能不支持签到功能`,
-            checkinRes,
-          );
+        // 若 LDOH 明确标记不支持签到，跳过探测，省一次 API 调用
+        if (data.checkinSupported === false) {
           checkinSupported = false;
-          checkedInToday = null; // 标记为不支持签到
+          checkedInToday = null;
+          Log.debug(`[签到数据] ${host} - LDOH 标记不支持签到，跳过探测`);
+        } else {
+          Log.debug(`[获取签到数据] ${host} - 月份: ${monthStr}`);
+          const checkinRes = await this.request(
+            "GET",
+            host,
+            `/api/user/checkin?month=${monthStr}`,
+            data.token,
+            userId,
+          );
+
+          if (checkinRes.success && checkinRes.data) {
+            checkedInToday = !!checkinRes.data?.stats?.checked_in_today;
+
+            // 特殊处理：wzw.pp.ua (WONG 公益站)
+            if (host === "wzw.pp.ua") {
+              Log.debug(`[签到数据] ${host} - 特殊站点`);
+              checkedInToday = !!checkinRes.data?.checked_in;
+            }
+
+            if (checkedInToday) lastCheckinDate = todayStr;
+
+            Log.debug(
+              `[签到数据] ${host} - 已签到: ${checkedInToday}, 签到日期: ${lastCheckinDate}`,
+            );
+          } else {
+            Log.warn(
+              `[签到数据获取失败] ${host} - 可能不支持签到功能`,
+              checkinRes,
+            );
+            checkinSupported = false;
+            checkedInToday = null;
+          }
         }
 
         // 更新数据
@@ -1156,6 +1153,17 @@
         data.checkinSupported = checkinSupported;
         data.lastCheckinDate = lastCheckinDate;
         data.userId = userId;
+
+        // 获取站点配置（CF Turnstile 等）：优先使用已缓存的值，否则请求 /api/status
+        if (data.turnstileCheck === undefined) {
+          const configRes = await this.fetchSiteConfig(host);
+          if (configRes.success && configRes.data) {
+            data.turnstileCheck = configRes.data.turnstile_check === true;
+            data.turnstileSiteKey = configRes.data.turnstile_site_key || null;
+            Log.debug(`[站点配置] ${host} - turnstile: ${data.turnstileCheck}`);
+          }
+        }
+
         Utils.saveSiteData(host, data);
 
         const checkinStatus = checkinSupported
@@ -1188,7 +1196,7 @@
           this.request(
             "GET",
             host,
-            "/api/token/?p=1&size=1000",
+            "/api/token/?p=0&size=1000",
             token,
             userId,
             null,
@@ -1197,7 +1205,11 @@
         ]);
 
         const models = pricingRes.success ? pricingRes.data : [];
-        const keys = tokenRes.success ? tokenRes.data?.items || [] : [];
+        const keys = tokenRes.success
+          ? Array.isArray(tokenRes.data)
+            ? tokenRes.data
+            : tokenRes.data?.items || []
+          : [];
 
         Log.debug(
           `[详情获取完成] ${host} - 模型: ${Array.isArray(models) ? models.length : 0}, 密钥: ${Array.isArray(keys) ? keys.length : 0}`,
@@ -1335,17 +1347,36 @@
       try {
         Log.debug(`[签到] ${host}`);
 
+        // 若站点需要 CF Turnstile 校验，尝试获取 token（失败则降级无 token 请求）
+        let checkinPath = "/api/user/checkin";
+        const siteData = Utils.getSiteData(host);
+        if (siteData.turnstileCheck && siteData.turnstileSiteKey) {
+          try {
+            Log.debug(`[签到] ${host} - 需要 CF Turnstile 校验`);
+            const turnstileToken = await Turnstile.getToken(
+              siteData.turnstileSiteKey,
+            );
+            checkinPath = `/api/user/checkin?turnstile=${encodeURIComponent(turnstileToken)}`;
+            Log.success(`[签到] ${host} - Turnstile token 获取成功`);
+          } catch (e) {
+            Log.warn(
+              `[签到] ${host} - Turnstile 获取失败，降级为无 token 请求`,
+              e,
+            );
+          }
+        }
+
         // 创建带超时的请求
         const timeoutPromise = new Promise((resolve) => {
           setTimeout(() => {
             resolve({ success: false, error: "签到超时（15秒）" });
-          }, 15000);
+          }, CONFIG.CHECKIN_TIMEOUT_MS);
         });
 
         const requestPromise = this.request(
           "POST",
           host,
-          "/api/user/checkin",
+          checkinPath,
           token,
           userId,
           null,
@@ -1376,6 +1407,76 @@
     },
   };
 
+  // ==================== CF Turnstile 模块 ====================
+  /**
+   * 在当前页面上获取 Cloudflare Turnstile 不可见校验 token。
+   * 注意：Turnstile sitekey 与域名绑定，仅当脚本运行在目标站点时有效。
+   * 从 LDOH 门户跨域调用时 token 获取会失败，checkin 将降级为无 token 请求。
+   */
+  const Turnstile = {
+    _container: null,
+
+    /** 确保 turnstile 脚本已加载 */
+    async _ensureLoaded() {
+      if (window.turnstile) return;
+      await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src =
+          "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("Turnstile 脚本加载失败"));
+        document.head.appendChild(script);
+        setTimeout(() => reject(new Error("Turnstile 脚本加载超时")), 10000);
+      });
+    },
+
+    /**
+     * 获取 Turnstile invisible challenge token
+     * @param {string} siteKey - Turnstile site key
+     * @returns {Promise<string>} token
+     */
+    async getToken(siteKey) {
+      await this._ensureLoaded();
+      return new Promise((resolve, reject) => {
+        if (!this._container) {
+          this._container = document.createElement("div");
+          this._container.style.cssText =
+            "position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;";
+          document.body.appendChild(this._container);
+        }
+
+        let widgetId;
+        const timer = setTimeout(() => {
+          if (widgetId !== undefined) {
+            try {
+              window.turnstile.remove(widgetId);
+            } catch (_) {}
+          }
+          reject(new Error("Turnstile 校验超时"));
+        }, 30000);
+
+        widgetId = window.turnstile.render(this._container, {
+          sitekey: siteKey,
+          size: "invisible",
+          callback: (token) => {
+            clearTimeout(timer);
+            try {
+              window.turnstile.remove(widgetId);
+            } catch (_) {}
+            resolve(token);
+          },
+          "error-callback": () => {
+            clearTimeout(timer);
+            try {
+              window.turnstile.remove(widgetId);
+            } catch (_) {}
+            reject(new Error("Turnstile 校验失败"));
+          },
+        });
+      });
+    },
+  };
+
   // ==================== UI 渲染函数 ====================
   /**
    * 判断站点今日是否已签到（对比 lastCheckinDate 与当天日期，避免跨日后误判）
@@ -1383,9 +1484,7 @@
   function isCheckedInToday(data) {
     if (data.checkedInToday !== true) return false;
     if (!data.lastCheckinDate) return true; // 旧缓存无日期字段，兼容处理
-    const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    return data.lastCheckinDate === today;
+    return data.lastCheckinDate === getTodayString();
   }
 
   /**
@@ -1499,6 +1598,315 @@
     container.appendChild(moreBtn);
   }
 
+  // ==================== 详情对话框辅助函数 ====================
+
+  /** 关闭对话框 overlay（带退出动画） */
+  function _closeDetailDialog() {
+    const ov = document.querySelector(".ldh-overlay");
+    if (!ov) return;
+    ov.querySelector(".ldh-dialog").style.animation =
+      `ldoh-zoom-in ${CONFIG.ANIMATION_FAST_MS}ms ease-in reverse forwards`;
+    ov.style.animation = `ldoh-fade-in-blur ${CONFIG.ANIMATION_FAST_MS}ms ease-in reverse forwards`;
+    setTimeout(() => ov.remove(), CONFIG.ANIMATION_FAST_MS);
+  }
+
+  /** 构建对话框头部（标题 + 关闭按钮） */
+  function _buildDetailHeader(host) {
+    const header = document.createElement("div");
+    header.className = "ldh-header";
+    const title = document.createElement("div");
+    title.className = "ldh-title";
+    title.textContent = host;
+    const closeBtn = document.createElement("div");
+    closeBtn.className = "ldh-close";
+    closeBtn.innerHTML =
+      '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+    closeBtn.onclick = _closeDetailDialog;
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    return header;
+  }
+
+  /** 构建创建密钥表单（含按钮），返回 { createForm, createKeyBtn } */
+  function _buildCreateKeyForm(host, data, onCreated) {
+    const createKeyBtn = document.createElement("button");
+    createKeyBtn.style.cssText =
+      "padding:4px 12px;background:var(--ldoh-primary);color:white;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;";
+    createKeyBtn.textContent = "+ 创建密钥";
+    createKeyBtn.onmouseover = () =>
+      (createKeyBtn.style.background = "var(--ldoh-primary-hover)");
+    createKeyBtn.onmouseout = () =>
+      (createKeyBtn.style.background = "var(--ldoh-primary)");
+
+    const createForm = document.createElement("div");
+    createForm.style.cssText =
+      "display:none;padding:16px;background:#f8fafc;border:1px solid var(--ldoh-border);border-radius:var(--ldoh-radius);margin-bottom:12px;";
+
+    const formGrid = document.createElement("div");
+    formGrid.style.cssText =
+      "display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;";
+
+    // 名称输入
+    const nameWrapper = document.createElement("div");
+    const nameLabel = document.createElement("div");
+    nameLabel.style.cssText =
+      "font-size:12px;font-weight:600;color:var(--ldoh-text);margin-bottom:6px;";
+    nameLabel.textContent = "密钥名称";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.placeholder = "请输入密钥名称";
+    nameInput.style.cssText =
+      "width:100%;padding:8px 10px;border:1px solid var(--ldoh-border);border-radius:6px;font-size:13px;outline:none;transition:all 0.2s;box-sizing:border-box;";
+    nameInput.onfocus = () =>
+      (nameInput.style.borderColor = "var(--ldoh-primary)");
+    nameInput.onblur = () =>
+      (nameInput.style.borderColor = "var(--ldoh-border)");
+    nameWrapper.appendChild(nameLabel);
+    nameWrapper.appendChild(nameInput);
+
+    // 分组选择
+    const groupWrapper = document.createElement("div");
+    const groupLabel = document.createElement("div");
+    groupLabel.style.cssText =
+      "font-size:12px;font-weight:600;color:var(--ldoh-text);margin-bottom:6px;";
+    groupLabel.textContent = "选择分组";
+    const groupSelect = document.createElement("select");
+    groupSelect.style.cssText =
+      "width:100%;padding:8px 10px;border:1px solid var(--ldoh-border);border-radius:6px;font-size:13px;outline:none;cursor:pointer;background:white;box-sizing:border-box;";
+    groupSelect.onfocus = () =>
+      (groupSelect.style.borderColor = "var(--ldoh-primary)");
+    groupSelect.onblur = () =>
+      (groupSelect.style.borderColor = "var(--ldoh-border)");
+    groupWrapper.appendChild(groupLabel);
+    groupWrapper.appendChild(groupSelect);
+
+    // 取消 / 创建按钮组
+    const btnGroup = document.createElement("div");
+    btnGroup.style.cssText = "display:flex;gap:8px;";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.textContent = "取消";
+    cancelBtn.style.cssText =
+      "padding:8px 16px;background:#e2e8f0;color:var(--ldoh-text);border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;";
+    cancelBtn.onmouseover = () => (cancelBtn.style.background = "#cbd5e1");
+    cancelBtn.onmouseout = () => (cancelBtn.style.background = "#e2e8f0");
+    cancelBtn.onclick = () => {
+      createForm.style.display = "none";
+      createKeyBtn.textContent = "+ 创建密钥";
+      nameInput.value = "";
+    };
+
+    const submitBtn = document.createElement("button");
+    submitBtn.textContent = "创建";
+    submitBtn.style.cssText =
+      "padding:8px 16px;background:var(--ldoh-primary);color:white;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;";
+    submitBtn.onmouseover = () =>
+      (submitBtn.style.background = "var(--ldoh-primary-hover)");
+    submitBtn.onmouseout = () =>
+      (submitBtn.style.background = "var(--ldoh-primary)");
+    submitBtn.onclick = async () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        Utils.toast.warning("请输入密钥名称");
+        nameInput.focus();
+        return;
+      }
+      submitBtn.disabled = true;
+      submitBtn.textContent = "创建中...";
+      submitBtn.style.opacity = "0.6";
+      try {
+        const result = await API.createToken(
+          host,
+          data.token,
+          data.userId,
+          name,
+          groupSelect.value,
+        );
+        if (result.success) {
+          Utils.toast.success("密钥创建成功");
+          createForm.style.display = "none";
+          createKeyBtn.textContent = "+ 创建密钥";
+          nameInput.value = "";
+          onCreated?.();
+        } else {
+          Utils.toast.error(result.message || "密钥创建失败");
+        }
+      } catch (e) {
+        Log.error("创建密钥失败", e);
+        Utils.toast.error("创建密钥失败");
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "创建";
+        submitBtn.style.opacity = "1";
+      }
+    };
+
+    btnGroup.appendChild(cancelBtn);
+    btnGroup.appendChild(submitBtn);
+    formGrid.appendChild(nameWrapper);
+    formGrid.appendChild(groupWrapper);
+    formGrid.appendChild(btnGroup);
+    createForm.appendChild(formGrid);
+
+    // 展开/收起表单
+    createKeyBtn.onclick = async () => {
+      if (createForm.style.display === "none") {
+        createKeyBtn.disabled = true;
+        createKeyBtn.textContent = "加载中...";
+        try {
+          const groups = await API.fetchGroups(host, data.token, data.userId);
+          groupSelect.innerHTML = "";
+          Object.entries(groups).forEach(([gName, gInfo]) => {
+            const opt = document.createElement("option");
+            opt.value = gName;
+            opt.textContent = `${gName} - ${gInfo.desc} (倍率: ${gInfo.ratio})`;
+            groupSelect.appendChild(opt);
+          });
+          createForm.style.display = "block";
+          createKeyBtn.textContent = "收起表单";
+          setTimeout(() => nameInput.focus(), 100);
+        } catch (e) {
+          Log.error("获取分组列表失败", e);
+          Utils.toast.error("获取分组列表失败");
+        } finally {
+          createKeyBtn.disabled = false;
+        }
+      } else {
+        createForm.style.display = "none";
+        createKeyBtn.textContent = "+ 创建密钥";
+        nameInput.value = "";
+      }
+    };
+
+    return { createForm, createKeyBtn };
+  }
+
+  /**
+   * 构建单个密钥卡片 item
+   * @param {object} k - 密钥数据
+   * @param {string} host
+   * @param {object} data - 站点数据
+   * @param {HTMLElement} keysGrid
+   * @param {Array} modelItems - 模型 item 引用数组（用于按分组过滤）
+   * @param {HTMLElement} modelsBadge - 模型数量徽章
+   * @param {Array} modelArray - 完整模型列表
+   */
+  function _buildKeyItem(
+    k,
+    host,
+    data,
+    keysGrid,
+    modelItems,
+    modelsBadge,
+    modelArray,
+  ) {
+    let selectedGroup = null;
+
+    const item = document.createElement("div");
+    item.className = "ldh-item ldh-key-item";
+    item.dataset.group = k.group || "";
+    item.dataset.key = `sk-${k.key}`;
+    item.style.position = "relative";
+    item.innerHTML = `
+      <div style="font-weight:700;color:var(--ldoh-text)">${Utils.escapeHtml(k.name || "未命名")}</div>
+      ${k.group ? `<div style="font-size:10px;color:var(--ldoh-primary);font-weight:600">Group: ${Utils.escapeHtml(k.group)}</div>` : ""}
+      <div style="font-size:10px;color:var(--ldoh-text-light);font-family:monospace;overflow:hidden;text-overflow:ellipsis">sk-${k.key.substring(0, 16)}...</div>
+    `;
+
+    // 删除按钮
+    const deleteBtn = document.createElement("div");
+    deleteBtn.innerHTML =
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>';
+    deleteBtn.style.cssText =
+      "position:absolute;top:8px;right:8px;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;cursor:pointer;opacity:0;transition:all 0.2s;color:var(--ldoh-danger);";
+    deleteBtn.title = "删除密钥";
+    deleteBtn.onmouseover = () =>
+      (deleteBtn.style.background = "rgba(239,68,68,0.1)");
+    deleteBtn.onmouseout = () => (deleteBtn.style.background = "transparent");
+    deleteBtn.onclick = (e) => {
+      e.stopPropagation();
+      UI.confirm(deleteBtn, `删除密钥 "${k.name || "未命名"}"？`, async () => {
+        deleteBtn.style.opacity = "0.5";
+        try {
+          const result = await API.deleteToken(
+            host,
+            data.token,
+            data.userId,
+            k.id,
+          );
+          if (result.success) {
+            Utils.toast.success("密钥删除成功");
+            item.style.animation =
+              "ldoh-slide-in 0.3s ease-in reverse forwards";
+            setTimeout(() => {
+              item.remove();
+              const badge = document.querySelector(
+                ".ldh-sec-title .ldh-sec-badge",
+              );
+              if (badge)
+                badge.textContent = Math.max(
+                  0,
+                  (parseInt(badge.textContent) || 0) - 1,
+                );
+            }, CONFIG.ANIMATION_NORMAL_MS);
+          } else {
+            Utils.toast.error(result.message || "密钥删除失败");
+            deleteBtn.style.opacity = "1";
+          }
+        } catch (e) {
+          Log.error("删除密钥失败", e);
+          Utils.toast.error("删除密钥失败");
+          deleteBtn.style.opacity = "1";
+        }
+      });
+    };
+
+    item.appendChild(deleteBtn);
+    item.onmouseenter = () => (deleteBtn.style.opacity = "1");
+    item.onmouseleave = () => (deleteBtn.style.opacity = "0");
+
+    // 点击：复制密钥 + 按分组过滤模型
+    item.onclick = (e) => {
+      if (e.target.closest("div") === deleteBtn) return;
+      const isAlreadyActive = item.classList.contains("active");
+      keysGrid
+        .querySelectorAll(".ldh-item")
+        .forEach((el) => el.classList.remove("active"));
+      if (isAlreadyActive) {
+        selectedGroup = null;
+        Utils.copy(item.dataset.key);
+        Utils.toast.success("已复制密钥");
+      } else {
+        item.classList.add("active");
+        selectedGroup = item.dataset.group;
+        Utils.copy(item.dataset.key);
+        Utils.toast.success(`已选中分组 ${selectedGroup || "默认"} 并复制密钥`);
+      }
+      let visibleCount = 0;
+      modelItems.forEach((mi) => {
+        let isVisible = true;
+        if (selectedGroup) {
+          try {
+            isVisible = JSON.parse(mi.dataset.modelGroups || "[]").includes(
+              selectedGroup,
+            );
+          } catch {
+            isVisible = mi.dataset.modelName
+              .toLowerCase()
+              .includes(selectedGroup.toLowerCase());
+          }
+        }
+        mi.style.display = isVisible ? "" : "none";
+        if (isVisible) visibleCount++;
+      });
+      modelsBadge.textContent = selectedGroup
+        ? `${visibleCount}/${modelArray.length}`
+        : modelArray.length;
+    };
+
+    return item;
+  }
+
   /**
    * 显示详情对话框
    * @param {string} host - 主机名
@@ -1506,446 +1914,165 @@
    */
   async function showDetailsDialog(host, data) {
     try {
-      const overlay = UI.createOverlay(
-        '<div class="ldh-header"><div class="ldh-title">正在获取密钥和模型...</div></div><div class="ldh-content" style="align-items:center;justify-content:center;min-height:200px"><div class="ldoh-refresh-btn loading"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg></div></div>',
+      const loadingOverlay = UI.createOverlay(
+        '<div class="ldh-header"><div class="ldh-title">正在获取密钥和模型...</div></div>' +
+          '<div class="ldh-content" style="align-items:center;justify-content:center;min-height:200px">' +
+          '<div class="ldoh-refresh-btn loading"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg></div></div>',
       );
 
       const details = await API.fetchDetails(host, data.token, data.userId);
-      overlay.remove();
+      loadingOverlay.remove();
 
       const { models, keys } = details;
       const keyArray = Array.isArray(keys) ? keys : [];
       const modelArray =
-        models && Array.isArray(models.data)
+        models?.data && Array.isArray(models.data)
           ? models.data
           : Array.isArray(models)
             ? models
             : [];
 
-      // 构建对话框内容
       const dialog = document.createElement("div");
       dialog.className = "ldh-dialog";
+      dialog.appendChild(_buildDetailHeader(host));
 
-      // 头部
-      const header = document.createElement("div");
-      header.className = "ldh-header";
-
-      const title = document.createElement("div");
-      title.className = "ldh-title";
-      title.textContent = host;
-      header.appendChild(title);
-
-      const closeBtn = document.createElement("div");
-      closeBtn.className = "ldh-close";
-      closeBtn.innerHTML =
-        '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
-      closeBtn.onclick = () => {
-        const currentOverlay = document.querySelector(".ldh-overlay");
-        if (currentOverlay) {
-          const dialog = currentOverlay.querySelector(".ldh-dialog");
-          dialog.style.animation = "ldoh-zoom-in 0.2s ease-in reverse forwards";
-          currentOverlay.style.animation =
-            "ldoh-fade-in-blur 0.2s ease-in reverse forwards";
-          setTimeout(() => currentOverlay.remove(), 200);
-        }
-      };
-      header.appendChild(closeBtn);
-
-      dialog.appendChild(header);
-
-      // 内容区
       const content = document.createElement("div");
       content.className = "ldh-content";
 
-      // 密钥部分
+      // ── 密钥区域 ──
+      const modelItems = [];
+      const modelsBadge = document.createElement("span");
+      modelsBadge.className = "ldh-sec-badge";
+      modelsBadge.textContent = modelArray.length;
+
       const keysSecHeader = document.createElement("div");
       keysSecHeader.className = "ldh-sec-header";
-
       const keysTitle = document.createElement("div");
       keysTitle.className = "ldh-sec-title";
       keysTitle.innerHTML = `<span>🔑 密钥列表</span><span class="ldh-sec-badge">${keyArray.length}</span>`;
       keysSecHeader.appendChild(keysTitle);
 
-      // 创建密钥按钮
-      const createKeyBtn = document.createElement("button");
-      createKeyBtn.style.cssText =
-        "padding: 4px 12px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
-      createKeyBtn.textContent = "+ 创建密钥";
-      createKeyBtn.onmouseover = () =>
-        (createKeyBtn.style.background = "var(--ldoh-primary-hover)");
-      createKeyBtn.onmouseout = () =>
-        (createKeyBtn.style.background = "var(--ldoh-primary)");
-      keysSecHeader.appendChild(createKeyBtn);
-
-      content.appendChild(keysSecHeader);
-
-      // 创建密钥表单（初始隐藏）
-      const createForm = document.createElement("div");
-      createForm.style.cssText =
-        "display: none; padding: 16px; background: #f8fafc; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius); margin-bottom: 12px;";
-
-      const formGrid = document.createElement("div");
-      formGrid.style.cssText =
-        "display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end;";
-
-      // 名称输入框
-      const nameWrapper = document.createElement("div");
-      const nameLabel = document.createElement("div");
-      nameLabel.style.cssText =
-        "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
-      nameLabel.textContent = "密钥名称";
-      const nameInput = document.createElement("input");
-      nameInput.type = "text";
-      nameInput.placeholder = "请输入密钥名称";
-      nameInput.style.cssText =
-        "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s;";
-      nameInput.onfocus = () =>
-        (nameInput.style.borderColor = "var(--ldoh-primary)");
-      nameInput.onblur = () =>
-        (nameInput.style.borderColor = "var(--ldoh-border)");
-      nameWrapper.appendChild(nameLabel);
-      nameWrapper.appendChild(nameInput);
-      formGrid.appendChild(nameWrapper);
-
-      // 分组选择
-      const groupWrapper = document.createElement("div");
-      const groupLabel = document.createElement("div");
-      groupLabel.style.cssText =
-        "font-size: 12px; font-weight: 600; color: var(--ldoh-text); margin-bottom: 6px;";
-      groupLabel.textContent = "选择分组";
-      const groupSelect = document.createElement("select");
-      groupSelect.style.cssText =
-        "width: 100%; padding: 8px 10px; border: 1px solid var(--ldoh-border); border-radius: 6px; font-size: 13px; outline: none; transition: all 0.2s; cursor: pointer; background: white;";
-      groupSelect.onfocus = () =>
-        (groupSelect.style.borderColor = "var(--ldoh-primary)");
-      groupSelect.onblur = () =>
-        (groupSelect.style.borderColor = "var(--ldoh-border)");
-      groupWrapper.appendChild(groupLabel);
-      groupWrapper.appendChild(groupSelect);
-      formGrid.appendChild(groupWrapper);
-
-      // 按钮组
-      const buttonGroup = document.createElement("div");
-      buttonGroup.style.cssText = "display: flex; gap: 8px;";
-
-      const cancelBtn = document.createElement("button");
-      cancelBtn.textContent = "取消";
-      cancelBtn.style.cssText =
-        "padding: 8px 16px; background: #e2e8f0; color: var(--ldoh-text); border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
-      cancelBtn.onmouseover = () => (cancelBtn.style.background = "#cbd5e1");
-      cancelBtn.onmouseout = () => (cancelBtn.style.background = "#e2e8f0");
-      cancelBtn.onclick = () => {
-        createForm.style.display = "none";
-        createKeyBtn.textContent = "+ 创建密钥";
-        nameInput.value = "";
-      };
-
-      const submitBtn = document.createElement("button");
-      submitBtn.textContent = "创建";
-      submitBtn.style.cssText =
-        "padding: 8px 16px; background: var(--ldoh-primary); color: white; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;";
-      submitBtn.onmouseover = () =>
-        (submitBtn.style.background = "var(--ldoh-primary-hover)");
-      submitBtn.onmouseout = () =>
-        (submitBtn.style.background = "var(--ldoh-primary)");
-      submitBtn.onclick = async () => {
-        const name = nameInput.value.trim();
-        const group = groupSelect.value;
-
-        if (!name) {
-          Utils.toast.warning("请输入密钥名称");
-          nameInput.focus();
-          return;
-        }
-
-        submitBtn.disabled = true;
-        submitBtn.textContent = "创建中...";
-        submitBtn.style.opacity = "0.6";
-        submitBtn.style.cursor = "not-allowed";
-
-        try {
-          const result = await API.createToken(
-            host,
-            data.token,
-            data.userId,
-            name,
-            group,
-          );
-
-          if (result.success) {
-            Utils.toast.success("密钥创建成功");
-            createForm.style.display = "none";
-            createKeyBtn.textContent = "+ 创建密钥";
-            nameInput.value = "";
-            // 关闭当前对话框并重新打开以刷新列表
-            const currentOverlay = document.querySelector(".ldh-overlay");
-            if (currentOverlay) {
-              currentOverlay.remove();
-            }
-            setTimeout(() => showDetailsDialog(host, data), 300);
-          } else {
-            Utils.toast.error(result.message || "密钥创建失败");
-            submitBtn.disabled = false;
-            submitBtn.textContent = "创建";
-            submitBtn.style.opacity = "1";
-            submitBtn.style.cursor = "pointer";
-          }
-        } catch (e) {
-          Log.error("创建密钥失败", e);
-          Utils.toast.error("创建密钥失败");
-          submitBtn.disabled = false;
-          submitBtn.textContent = "创建";
-          submitBtn.style.opacity = "1";
-          submitBtn.style.cursor = "pointer";
-        }
-      };
-
-      buttonGroup.appendChild(cancelBtn);
-      buttonGroup.appendChild(submitBtn);
-      formGrid.appendChild(buttonGroup);
-
-      createForm.appendChild(formGrid);
-      content.appendChild(createForm);
-
-      // 创建密钥按钮点击事件
-      createKeyBtn.onclick = async () => {
-        if (createForm.style.display === "none") {
-          // 展开表单，先获取分组列表
-          createKeyBtn.disabled = true;
-          createKeyBtn.textContent = "加载中...";
-
-          try {
-            const groups = await API.fetchGroups(host, data.token, data.userId);
-
-            // 清空并填充分组选项
-            groupSelect.innerHTML = "";
-            Object.entries(groups).forEach(([groupName, groupInfo]) => {
-              const option = document.createElement("option");
-              option.value = groupName;
-              option.textContent = `${groupName} - ${groupInfo.desc} (倍率: ${groupInfo.ratio})`;
-              groupSelect.appendChild(option);
-            });
-
-            createForm.style.display = "block";
-            createKeyBtn.textContent = "收起表单";
-            setTimeout(() => nameInput.focus(), 100);
-          } catch (e) {
-            Log.error("获取分组列表失败", e);
-            Utils.toast.error("获取分组列表失败");
-          } finally {
-            createKeyBtn.disabled = false;
-          }
-        } else {
-          // 收起表单
-          createForm.style.display = "none";
-          createKeyBtn.textContent = "+ 创建密钥";
-          nameInput.value = "";
-        }
-      };
-
+      // keysGrid 需先于 _buildCreateKeyForm 创建，供 onCreated 回调引用
       const keysGrid = document.createElement("div");
       keysGrid.className = "ldh-grid";
-
-      let selectedGroup = null;
-      const modelItems = [];
-
       if (keyArray.length) {
-        keyArray.forEach((k) => {
-          const item = document.createElement("div");
-          item.className = "ldh-item ldh-key-item";
-          item.dataset.group = k.group || "";
-          item.dataset.key = `sk-${k.key}`;
-          item.style.position = "relative";
-
-          item.innerHTML = `
-            <div style="font-weight: 700; color: var(--ldoh-text)">${Utils.escapeHtml(k.name || "未命名")}</div>
-            ${k.group ? `<div style="font-size: 10px; color: var(--ldoh-primary); font-weight: 600">Group: ${Utils.escapeHtml(k.group)}</div>` : ""}
-            <div style="font-size: 10px; color: var(--ldoh-text-light); font-family: monospace; overflow: hidden; text-overflow: ellipsis">sk-${k.key.substring(0, 16)}...</div>
-          `;
-
-          // 删除按钮
-          const deleteBtn = document.createElement("div");
-          deleteBtn.innerHTML =
-            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
-          deleteBtn.style.cssText =
-            "position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; background: transparent; border-radius: 4px; cursor: pointer; opacity: 0; transition: all 0.2s; color: var(--ldoh-danger);";
-          deleteBtn.title = "删除密钥";
-
-          deleteBtn.onmouseover = () => {
-            deleteBtn.style.background = "rgba(239, 68, 68, 0.1)";
-          };
-          deleteBtn.onmouseout = () => {
-            deleteBtn.style.background = "transparent";
-          };
-
-          deleteBtn.onclick = async (e) => {
-            e.stopPropagation();
-
-            const confirmDelete = window.confirm(
-              `确定要删除密钥 "${k.name || "未命名"}" 吗？\n\n此操作不可恢复！`,
-            );
-            if (!confirmDelete) return;
-
-            try {
-              deleteBtn.style.opacity = "0.5";
-              deleteBtn.style.cursor = "not-allowed";
-
-              const result = await API.deleteToken(
-                host,
-                data.token,
-                data.userId,
-                k.id,
-              );
-
-              if (result.success) {
-                Utils.toast.success("密钥删除成功");
-                // 从 DOM 中移除该项
-                item.style.animation =
-                  "ldoh-slide-in 0.3s ease-in reverse forwards";
-                setTimeout(() => {
-                  item.remove();
-                  // 更新密钥数量徽章
-                  const badge = document.querySelector(
-                    ".ldh-sec-title .ldh-sec-badge",
-                  );
-                  if (badge) {
-                    const currentCount = parseInt(badge.textContent) || 0;
-                    badge.textContent = Math.max(0, currentCount - 1);
-                  }
-                }, 300);
-              } else {
-                Utils.toast.error(result.message || "密钥删除失败");
-                deleteBtn.style.opacity = "1";
-                deleteBtn.style.cursor = "pointer";
-              }
-            } catch (e) {
-              Log.error("删除密钥失败", e);
-              Utils.toast.error("删除密钥失败");
-              deleteBtn.style.opacity = "1";
-              deleteBtn.style.cursor = "pointer";
-            }
-          };
-
-          item.appendChild(deleteBtn);
-
-          // 鼠标悬停时显示删除按钮
-          item.onmouseenter = () => {
-            deleteBtn.style.opacity = "1";
-          };
-          item.onmouseleave = () => {
-            deleteBtn.style.opacity = "0";
-          };
-
-          item.onclick = (e) => {
-            // 如果点击的是删除按钮，不执行复制逻辑
-            if (e.target.closest("div") === deleteBtn) return;
-
-            const isAlreadyActive = item.classList.contains("active");
-            keysGrid
-              .querySelectorAll(".ldh-item")
-              .forEach((el) => el.classList.remove("active"));
-
-            if (isAlreadyActive) {
-              selectedGroup = null;
-              Utils.copy(item.dataset.key);
-              Utils.toast.success("已复制密钥");
-            } else {
-              item.classList.add("active");
-              selectedGroup = item.dataset.group;
-              Utils.copy(item.dataset.key);
-              Utils.toast.success(
-                `已选中分组 ${selectedGroup || "默认"} 并复制密钥`,
-              );
-            }
-
-            let visibleCount = 0;
-            modelItems.forEach((mi) => {
-              let isVisible = true;
-              if (selectedGroup) {
-                try {
-                  const groups = JSON.parse(mi.dataset.modelGroups || "[]");
-                  isVisible = groups.includes(selectedGroup);
-                } catch (e) {
-                  isVisible = mi.dataset.modelName
-                    .toLowerCase()
-                    .includes(selectedGroup.toLowerCase());
-                }
-              }
-              mi.style.display = isVisible ? "" : "none";
-              if (isVisible) visibleCount++;
-            });
-            modelsBadge.textContent = selectedGroup
-              ? `${visibleCount}/${modelArray.length}`
-              : modelArray.length;
-          };
-
-          keysGrid.appendChild(item);
-        });
+        keyArray.forEach((k) =>
+          keysGrid.appendChild(
+            _buildKeyItem(
+              k,
+              host,
+              data,
+              keysGrid,
+              modelItems,
+              modelsBadge,
+              modelArray,
+            ),
+          ),
+        );
       } else {
         const empty = document.createElement("div");
-        empty.style.gridColumn = "1/-1";
-        empty.style.textAlign = "center";
-        empty.style.padding = "20px";
-        empty.style.color = "var(--ldoh-text-light)";
+        empty.style.cssText =
+          "grid-column:1/-1;text-align:center;padding:20px;color:var(--ldoh-text-light);";
         empty.textContent = "暂无可用密钥";
         keysGrid.appendChild(empty);
       }
+
+      // 创建成功后就地刷新密钥列表，无需关/开弹窗
+      const onCreated = async () => {
+        const tokenRes = await API.request(
+          "GET",
+          host,
+          "/api/token/?p=1&size=1000",
+          data.token,
+          data.userId,
+          null,
+          true,
+        );
+        const newKeys = tokenRes.success
+          ? Array.isArray(tokenRes.data)
+            ? tokenRes.data
+            : tokenRes.data?.items || []
+          : [];
+        keysGrid.innerHTML = "";
+        if (newKeys.length) {
+          newKeys.forEach((k) =>
+            keysGrid.appendChild(
+              _buildKeyItem(
+                k,
+                host,
+                data,
+                keysGrid,
+                modelItems,
+                modelsBadge,
+                modelArray,
+              ),
+            ),
+          );
+        } else {
+          const empty = document.createElement("div");
+          empty.style.cssText =
+            "grid-column:1/-1;text-align:center;padding:20px;color:var(--ldoh-text-light);";
+          empty.textContent = "暂无可用密钥";
+          keysGrid.appendChild(empty);
+        }
+        const badge = keysTitle.querySelector(".ldh-sec-badge");
+        if (badge) badge.textContent = newKeys.length;
+      };
+
+      const { createForm, createKeyBtn } = _buildCreateKeyForm(
+        host,
+        data,
+        onCreated,
+      );
+      keysSecHeader.appendChild(createKeyBtn);
+      content.appendChild(keysSecHeader);
+      content.appendChild(createForm);
       content.appendChild(keysGrid);
 
-      // 模型部分
+      // ── 模型区域 ──
       const modelsSecHeader = document.createElement("div");
       modelsSecHeader.className = "ldh-sec-header";
-
       const modelsTitle = document.createElement("div");
       modelsTitle.className = "ldh-sec-title";
       modelsTitle.innerHTML = `<span>🤖 模型列表</span>`;
-      const modelsBadge = document.createElement("span");
-      modelsBadge.className = "ldh-sec-badge";
-      modelsBadge.textContent = modelArray.length;
       modelsTitle.appendChild(modelsBadge);
       modelsSecHeader.appendChild(modelsTitle);
       content.appendChild(modelsSecHeader);
 
       const modelsGrid = document.createElement("div");
       modelsGrid.className = "ldh-grid";
-
       if (modelArray.length) {
         modelArray.forEach((m) => {
+          const modelName = m.model_name || m;
           const item = document.createElement("div");
           item.className = "ldh-item";
-          const modelName = m.model_name || m;
           item.dataset.copy = modelName;
           item.dataset.modelName = modelName;
           item.dataset.modelGroups = JSON.stringify(m.enable_groups || []);
-
           item.innerHTML = `
-            <div style="font-weight: 600">${Utils.escapeHtml(modelName)}</div>
-            <div style="font-size: 9px; color: var(--ldoh-text-light)">点击复制</div>
+            <div style="font-weight:600">${Utils.escapeHtml(modelName)}</div>
+            <div style="font-size:9px;color:var(--ldoh-text-light)">点击复制</div>
           `;
-
           item.onclick = () => {
-            Utils.copy(item.dataset.copy);
+            Utils.copy(modelName);
             Utils.toast.success("已复制模型名");
           };
-
           modelsGrid.appendChild(item);
           modelItems.push(item);
         });
       } else {
         const empty = document.createElement("div");
-        empty.style.gridColumn = "1/-1";
-        empty.style.textAlign = "center";
-        empty.style.padding = "20px";
-        empty.style.color = "var(--ldoh-text-light)";
+        empty.style.cssText =
+          "grid-column:1/-1;text-align:center;padding:20px;color:var(--ldoh-text-light);";
         empty.textContent = "暂无可用模型";
         modelsGrid.appendChild(empty);
       }
-
       content.appendChild(modelsGrid);
+
       dialog.appendChild(content);
 
-      const newOverlay = UI.createOverlay("");
-      newOverlay.querySelector(".ldh-dialog").replaceWith(dialog);
+      const overlay = UI.createOverlay("");
+      overlay.querySelector(".ldh-dialog").replaceWith(dialog);
     } catch (e) {
       Log.error(`[详情失败] ${host}`, e);
       Utils.toast.error("获取详情失败");
@@ -1966,15 +2093,69 @@
       ov.innerHTML = `<div class="ldh-dialog">${html}</div>`;
       ov.onclick = (e) => {
         if (e.target === ov) {
-          const dialog = ov.querySelector(".ldh-dialog");
-          dialog.style.animation = "ldoh-zoom-in 0.2s ease-in reverse forwards";
-          ov.style.animation =
-            "ldoh-fade-in-blur 0.2s ease-in reverse forwards";
-          setTimeout(() => ov.remove(), 200);
+          ov.querySelector(".ldh-dialog").style.animation =
+            `ldoh-zoom-in ${CONFIG.ANIMATION_FAST_MS}ms ease-in reverse forwards`;
+          ov.style.animation = `ldoh-fade-in-blur ${CONFIG.ANIMATION_FAST_MS}ms ease-in reverse forwards`;
+          setTimeout(() => ov.remove(), CONFIG.ANIMATION_FAST_MS);
         }
       };
       document.body.appendChild(ov);
       return ov;
+    },
+
+    /**
+     * 弹出锚定在 anchorEl 附近的确认 Popover
+     * @param {HTMLElement} anchorEl - 锚定元素
+     * @param {string} text - 提示文本
+     * @param {Function} onConfirm - 确认回调（支持异步）
+     */
+    confirm(anchorEl, text, onConfirm) {
+      if (!anchorEl) return;
+      document.getElementById("ldoh-confirm-pop")?.remove();
+      Utils.injectStyles();
+
+      const pop = document.createElement("div");
+      pop.id = "ldoh-confirm-pop";
+      pop.className = "ldoh-confirm-pop";
+      pop.innerHTML = `
+        <span>${Utils.escapeHtml(text)}</span>
+        <button class="ldoh-pop-btn ldoh-pop-cancel">取消</button>
+        <button class="ldoh-pop-btn ldoh-pop-confirm">确认</button>
+      `;
+
+      const rect = anchorEl.getBoundingClientRect();
+      pop.style.top = `${rect.top - 48}px`;
+      pop.style.right = `${window.innerWidth - rect.right}px`;
+      document.body.appendChild(pop);
+
+      let outsideHandler;
+      const remove = () => {
+        if (outsideHandler)
+          document.removeEventListener("click", outsideHandler);
+        pop.remove();
+      };
+
+      pop.querySelector(".ldoh-pop-cancel").onclick = (e) => {
+        e.stopPropagation();
+        remove();
+      };
+      pop.querySelector(".ldoh-pop-confirm").onclick = (e) => {
+        e.stopPropagation();
+        remove();
+        try {
+          const r = onConfirm?.();
+          if (r?.then) r.catch((err) => Log.error("[确认操作执行失败]", err));
+        } catch (err) {
+          Log.error("[确认操作执行失败]", err);
+        }
+      };
+
+      setTimeout(() => {
+        outsideHandler = (e) => {
+          if (!pop.contains(e.target) && !anchorEl.contains(e.target)) remove();
+        };
+        document.addEventListener("click", outsideHandler);
+      }, 0);
     },
   };
 
@@ -1986,36 +2167,6 @@
    * @param {string|null} fallback - 备用值
    * @returns {string|null} 站点名称
    */
-  function extractSiteName(card, fallback) {
-    // LDOH 卡片标准结构：站点名称在 h3 > a 中
-    const h3Link = card.querySelector("h3 a");
-    if (h3Link) {
-      const text = h3Link.textContent.trim();
-      if (
-        text &&
-        text.length >= 2 &&
-        text.length <= 40 &&
-        !text.includes("http")
-      ) {
-        return text;
-      }
-    }
-    // 回退：h3 文本
-    const h3 = card.querySelector("h3");
-    if (h3) {
-      const text = h3.textContent.trim();
-      if (
-        text &&
-        text.length >= 2 &&
-        text.length <= 40 &&
-        !text.includes("http")
-      ) {
-        return text;
-      }
-    }
-    return fallback;
-  }
-
   /**
    * 根据 host 查找对应的卡片元素
    * @param {string} host - 主机名
@@ -2121,7 +2272,10 @@
       this._isOpen = true;
       this._panel.style.display = "flex";
       this._panel.classList.add("ldoh-panel-in");
-      setTimeout(() => this._panel.classList.remove("ldoh-panel-in"), 300);
+      setTimeout(
+        () => this._panel.classList.remove("ldoh-panel-in"),
+        CONFIG.ANIMATION_NORMAL_MS,
+      );
       this.render();
     },
 
@@ -2396,13 +2550,6 @@
           },
         },
         {
-          label: "刷新站点白名单",
-          handler: () => {
-            const list = Utils.updateSiteWhitelist();
-            Utils.toast.success(`站点白名单已刷新，共 ${list.length} 个站点`);
-          },
-        },
-        {
           label: "清理缓存",
           danger: true,
           handler: (triggerEl) => {
@@ -2481,7 +2628,7 @@
         <div style="padding:24px">
         <h2 style="margin:0 0 16px;font-size:16px;font-weight:700;color:var(--ldoh-text)">使用说明</h2>
         <div style="font-size:13px;color:var(--ldoh-text-muted);line-height:1.7;max-height:60vh;overflow-y:auto;padding-right:4px">
-          <p style="margin:0 0 12px"><strong style="color:var(--ldoh-text)">LDOH New API Helper v1.0.15</strong><br>自动同步 LDOH 白名单站点的额度与签到状态，并提供悬浮面板快速操作。</p>
+          <p style="margin:0 0 12px"><strong style="color:var(--ldoh-text)">LDOH New API Helper v1.0.16</strong><br>自动同步 LDOH 白名单站点的额度与签到状态，并提供悬浮面板快速操作。</p>
 
           <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">核心功能</p>
           <ul style="margin:0 0 12px;padding-left:16px">
@@ -2501,8 +2648,7 @@
 
           <p style="margin:0 0 6px;font-weight:600;color:var(--ldoh-text)">白名单 / 黑名单</p>
           <ul style="margin:0 0 12px;padding-left:16px">
-            <li>仅识别 LDOH 页面上的白名单站点</li>
-            <li>可在设置中「刷新站点白名单」重新扫描当前页面</li>
+            <li>仅识别 LDOH 页面上的白名单站点（通过监控 /api/sites 自动维护）</li>
             <li>检测黑名单：被屏蔽的站点不会发送 API 请求</li>
             <li>签到黑名单：被屏蔽的站点跳过自动签到</li>
             <li>内置黑名单条目可被用户覆盖移除；设置中可整体重置</li>
@@ -2615,21 +2761,27 @@
       this._removeSettingsMenu();
       this._removeConfirmPopover();
       this._removeConcurrencyPopover();
-      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
-      // 按余额从大到小排序，过滤无 userId 站点
+      const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
       const sorted = Object.entries(allData)
         .filter(([, d]) => d.userId)
         .sort(([, a], [, b]) => (b.quota || 0) - (a.quota || 0));
-
       const totalBalance = sorted.reduce(
         (sum, [, d]) => sum + (d.quota || 0),
         0,
       );
 
       this._panel.innerHTML = "";
+      this._panel.appendChild(this._buildHeader(sorted, totalBalance));
+      const { searchBar, bindSearch } = this._buildSearchBar();
+      this._panel.appendChild(searchBar);
+      const body = this._buildBody(sorted);
+      this._panel.appendChild(body);
+      bindSearch(body);
+    },
 
-      // 头部
+    /** 构建面板头部（标题、总额、操作按钮） */
+    _buildHeader(sorted, totalBalance) {
       const hd = document.createElement("div");
       hd.className = "ldoh-panel-hd";
       hd.innerHTML = `
@@ -2714,9 +2866,11 @@
       hd.appendChild(checkinBtn);
       hd.appendChild(settingsBtn);
       hd.appendChild(closeBtn);
-      this._panel.appendChild(hd);
+      return hd;
+    },
 
-      // 搜索栏
+    /** 构建搜索栏，返回 { searchBar, bindSearch(body) } */
+    _buildSearchBar() {
       const searchBar = document.createElement("div");
       searchBar.className = "ldoh-panel-search";
       searchBar.innerHTML = `
@@ -2725,9 +2879,31 @@
           <input class="ldoh-panel-search-input" placeholder="搜索站点名称..." value="${Utils.escapeHtml(this._searchQuery)}">
         </div>
       `;
-      this._panel.appendChild(searchBar);
 
-      // 列表
+      const bindSearch = (body) => {
+        const searchInput = searchBar.querySelector(".ldoh-panel-search-input");
+        let timer = null;
+        searchInput.oninput = () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            this._searchQuery = searchInput.value.toLowerCase().trim();
+            body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
+              row.style.display =
+                !this._searchQuery ||
+                row.dataset.searchKey.includes(this._searchQuery)
+                  ? ""
+                  : "none";
+            });
+          }, 200);
+        };
+        if (this._searchQuery) searchInput.focus();
+      };
+
+      return { searchBar, bindSearch };
+    },
+
+    /** 构建站点列表 body */
+    _buildBody(sorted) {
       const body = document.createElement("div");
       body.className = "ldoh-panel-body";
 
@@ -2738,216 +2914,205 @@
         body.appendChild(empty);
       } else {
         sorted.forEach(([host, siteData]) => {
-          const row = document.createElement("div");
-          row.className = "ldoh-panel-row";
-
-          // 签到状态
-          let checkinClass = "na",
-            checkinText = "─";
-          if (siteData.checkinSupported !== false) {
-            if (isCheckedInToday(siteData)) {
-              checkinClass = "ok";
-              checkinText = "已签到";
-            } else if (
-              siteData.checkedInToday === false ||
-              siteData.lastCheckinDate
-            ) {
-              checkinClass = "no";
-              checkinText = "未签到";
-            }
-          }
-
-          const displayName = siteData.siteName || host;
-          row.dataset.searchKey = `${displayName} ${host}`.toLowerCase();
-          if (
-            this._searchQuery &&
-            !row.dataset.searchKey.includes(this._searchQuery)
-          ) {
-            row.style.display = "none";
-          }
-
-          const nameEl = document.createElement("div");
-          nameEl.className = "ldoh-panel-name";
-          nameEl.title = host;
-          nameEl.textContent = displayName;
-
-          const checkinEl = document.createElement("div");
-          checkinEl.className = `ldoh-panel-checkin ${checkinClass}`;
-          checkinEl.textContent = checkinText;
-
-          const balanceEl = document.createElement("div");
-          balanceEl.className = "ldoh-panel-balance";
-          balanceEl.textContent = `$${Utils.formatQuota(siteData.quota)}`;
-
-          row.appendChild(nameEl);
-          row.appendChild(checkinEl);
-          row.appendChild(balanceEl);
-
-          // 密钥按钮
-          const keyBtn = document.createElement("div");
-          keyBtn.className = "ldoh-btn";
-          keyBtn.title = "密钥与模型";
-          keyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`;
-          keyBtn.onclick = (e) => {
-            e.stopPropagation();
-            showDetailsDialog(host, siteData);
-          };
-
-          // 刷新按钮
-          const refreshBtn = document.createElement("div");
-          refreshBtn.className = "ldoh-btn ldoh-refresh-btn";
-          refreshBtn.title = "刷新数据";
-          refreshBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>`;
-          refreshBtn.onclick = async (e) => {
-            e.stopPropagation();
-            if (refreshBtn.classList.contains("loading")) return;
-            try {
-              refreshBtn.classList.add("loading");
-              const fresh = await API.updateSiteStatus(
-                host,
-                siteData.userId,
-                true,
-              );
-              const card = findCardByHost(host);
-              if (card) renderHelper(card, host, fresh);
-              FloatingPanel.refresh();
-              Utils.toast.success(`${host} 已更新`);
-            } catch (err) {
-              Log.error(`[面板刷新] ${host}`, err);
-              Utils.toast.error("刷新失败");
-            } finally {
-              refreshBtn.classList.remove("loading");
-            }
-          };
-
-          // 定位按钮
-          const locateBtn = document.createElement("div");
-          locateBtn.className = "ldoh-btn";
-          locateBtn.title = "定位卡片";
-          locateBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>`;
-          locateBtn.onclick = (e) => {
-            e.stopPropagation();
-            const card = findCardByHost(host);
-            if (card) {
-              card.scrollIntoView({ behavior: "smooth", block: "center" });
-              card.style.outline = "2px solid var(--ldoh-primary)";
-              card.style.outlineOffset = "2px";
-              setTimeout(() => {
-                card.style.outline = "";
-                card.style.outlineOffset = "";
-              }, 2000);
-            } else {
-              Utils.toast.warning(`未找到 ${host} 的卡片`);
-            }
-          };
-
-          row.appendChild(keyBtn);
-          row.appendChild(refreshBtn);
-          row.appendChild(locateBtn);
-
-          // 站点黑名单按钮（eye 图标：绿=检测中，灰=已屏蔽）
-          const isBlacklisted = Utils.isBlacklisted(host);
-          const blacklistBtn = document.createElement("div");
-          blacklistBtn.className = "ldoh-btn";
-          blacklistBtn.title = isBlacklisted
-            ? "已屏蔽（点击恢复检测）"
-            : "检测中（点击加入黑名单）";
-          blacklistBtn.style.color = isBlacklisted
-            ? "#9ca3af"
-            : "var(--ldoh-success)";
-          blacklistBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
-          blacklistBtn.onclick = (e) => {
-            e.stopPropagation();
-            const confirmText = isBlacklisted
-              ? `移出黑名单并恢复检测？`
-              : `加入黑名单并停止检测？`;
-            this._showConfirmPopover(blacklistBtn, confirmText, () => {
-              const added = Utils.toggleBlacklist(host);
-              Utils.toast.success(
-                added ? `${host} 已加入黑名单` : `${host} 已移出黑名单`,
-              );
-              FloatingPanel.refresh();
-            });
-          };
-          row.appendChild(blacklistBtn);
-
-          // 跳过签到按钮（calendar 图标：绿=参与签到，灰=跳过签到）
-          const isSkipped = Utils.isCheckinSkipped(host);
-          const skipCheckinBtn = document.createElement("div");
-          skipCheckinBtn.className = "ldoh-btn";
-          skipCheckinBtn.title = isSkipped
-            ? "已跳过签到（点击恢复）"
-            : "参与签到（点击跳过）";
-          skipCheckinBtn.style.color = isSkipped
-            ? "#9ca3af"
-            : "var(--ldoh-success)";
-          skipCheckinBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><polyline points="9 16 11 18 15 14"/></svg>`;
-          skipCheckinBtn.onclick = (e) => {
-            e.stopPropagation();
-            const confirmText = isSkipped
-              ? `恢复 ${host} 自动签到？`
-              : `跳过 ${host} 自动签到？`;
-            this._showConfirmPopover(skipCheckinBtn, confirmText, () => {
-              const added = Utils.toggleCheckinSkip(host);
-              Utils.toast.success(
-                added ? `${host} 已跳过自动签到` : `${host} 已恢复自动签到`,
-              );
-              FloatingPanel.refresh();
-            });
-          };
-          row.appendChild(skipCheckinBtn);
-
-          // 删除按钮
-          const deleteBtn = document.createElement("div");
-          deleteBtn.className = "ldoh-btn";
-          deleteBtn.title = "删除缓存数据";
-          deleteBtn.style.color = "var(--ldoh-danger)";
-          deleteBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
-          deleteBtn.onmouseenter = () =>
-            (deleteBtn.style.background = "rgba(239, 68, 68, 0.1)");
-          deleteBtn.onmouseleave = () =>
-            (deleteBtn.style.background = "transparent");
-          deleteBtn.onclick = (e) => {
-            e.stopPropagation();
-            this._showConfirmPopover(deleteBtn, "确认删除？", () => {
-              const all = GM_getValue(CONFIG.STORAGE_KEY, {});
-              delete all[Utils.normalizeHost(host)];
-              GM_setValue(CONFIG.STORAGE_KEY, all);
-              const card = findCardByHost(host);
-              if (card) {
-                const container = card.querySelector(
-                  `.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`,
-                );
-                if (container) container.remove();
-              }
-              FloatingPanel.refresh();
-              Utils.toast.success(`已删除 ${host} 的缓存数据`);
-            });
-          };
-          row.appendChild(deleteBtn);
-
-          body.appendChild(row);
+          body.appendChild(this._buildSiteRow(host, siteData));
         });
       }
-      this._panel.appendChild(body);
 
-      // 绑定搜索过滤（在 body 渲染完成后绑定，避免先绑定找不到 rows）
-      const searchInput = searchBar.querySelector(".ldoh-panel-search-input");
-      let searchDebounceTimer = null;
-      searchInput.oninput = () => {
-        clearTimeout(searchDebounceTimer);
-        searchDebounceTimer = setTimeout(() => {
-          this._searchQuery = searchInput.value.toLowerCase().trim();
-          body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
-            const match =
-              !this._searchQuery ||
-              row.dataset.searchKey.includes(this._searchQuery);
-            row.style.display = match ? "" : "none";
-          });
-        }, 200);
+      return body;
+    },
+
+    /** 构建单个站点行 */
+    _buildSiteRow(host, siteData) {
+      const row = document.createElement("div");
+      row.className = "ldoh-panel-row";
+
+      // 签到状态
+      let checkinClass = "na",
+        checkinText = "─";
+      if (siteData.checkinSupported !== false) {
+        if (isCheckedInToday(siteData)) {
+          checkinClass = "ok";
+          checkinText = "已签到";
+        } else if (
+          siteData.checkedInToday === false ||
+          siteData.lastCheckinDate
+        ) {
+          checkinClass = "no";
+          checkinText = "未签到";
+        }
+      }
+
+      const displayName = siteData.siteName || host;
+      row.dataset.searchKey = `${displayName} ${host}`.toLowerCase();
+      if (
+        this._searchQuery &&
+        !row.dataset.searchKey.includes(this._searchQuery)
+      ) {
+        row.style.display = "none";
+      }
+
+      const nameEl = document.createElement("div");
+      nameEl.className = "ldoh-panel-name";
+      nameEl.title = host;
+      nameEl.textContent = displayName;
+
+      const checkinEl = document.createElement("div");
+      checkinEl.className = `ldoh-panel-checkin ${checkinClass}`;
+      checkinEl.textContent = checkinText;
+
+      const balanceEl = document.createElement("div");
+      balanceEl.className = "ldoh-panel-balance";
+      balanceEl.textContent = `$${Utils.formatQuota(siteData.quota)}`;
+
+      row.appendChild(nameEl);
+      row.appendChild(checkinEl);
+      row.appendChild(balanceEl);
+
+      // 密钥按钮
+      const keyBtn = document.createElement("div");
+      keyBtn.className = "ldoh-btn";
+      keyBtn.title = "密钥与模型";
+      keyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`;
+      keyBtn.onclick = (e) => {
+        e.stopPropagation();
+        showDetailsDialog(host, siteData);
       };
-      // 自动聚焦（仅在有已有内容时）
-      if (this._searchQuery) searchInput.focus();
+
+      // 刷新按钮
+      const refreshBtn = document.createElement("div");
+      refreshBtn.className = "ldoh-btn ldoh-refresh-btn";
+      refreshBtn.title = "刷新数据";
+      refreshBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>`;
+      refreshBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (refreshBtn.classList.contains("loading")) return;
+        try {
+          refreshBtn.classList.add("loading");
+          const fresh = await API.updateSiteStatus(host, siteData.userId, true);
+          const card = findCardByHost(host);
+          if (card) renderHelper(card, host, fresh);
+          FloatingPanel.refresh();
+          Utils.toast.success(`${host} 已更新`);
+        } catch (err) {
+          Log.error(`[面板刷新] ${host}`, err);
+          Utils.toast.error("刷新失败");
+        } finally {
+          refreshBtn.classList.remove("loading");
+        }
+      };
+
+      // 定位按钮
+      const locateBtn = document.createElement("div");
+      locateBtn.className = "ldoh-btn";
+      locateBtn.title = "定位卡片";
+      locateBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>`;
+      locateBtn.onclick = (e) => {
+        e.stopPropagation();
+        const card = findCardByHost(host);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.style.outline = "2px solid var(--ldoh-primary)";
+          card.style.outlineOffset = "2px";
+          setTimeout(() => {
+            card.style.outline = "";
+            card.style.outlineOffset = "";
+          }, 2000);
+        } else {
+          Utils.toast.warning(`未找到 ${host} 的卡片`);
+        }
+      };
+
+      row.appendChild(keyBtn);
+      row.appendChild(refreshBtn);
+      row.appendChild(locateBtn);
+
+      // 检测黑名单按钮（绿=检测中，灰=已屏蔽）
+      const isBlacklisted = Utils.isBlacklisted(host);
+      const blacklistBtn = document.createElement("div");
+      blacklistBtn.className = "ldoh-btn";
+      blacklistBtn.title = isBlacklisted
+        ? "已屏蔽（点击恢复检测）"
+        : "检测中（点击加入黑名单）";
+      blacklistBtn.style.color = isBlacklisted
+        ? "#9ca3af"
+        : "var(--ldoh-success)";
+      blacklistBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+      blacklistBtn.onclick = (e) => {
+        e.stopPropagation();
+        const confirmText = isBlacklisted
+          ? `移出黑名单并恢复检测？`
+          : `加入黑名单并停止检测？`;
+        this._showConfirmPopover(blacklistBtn, confirmText, () => {
+          const added = Utils.toggleBlacklist(host);
+          Utils.toast.success(
+            added ? `${host} 已加入黑名单` : `${host} 已移出黑名单`,
+          );
+          FloatingPanel.refresh();
+        });
+      };
+      row.appendChild(blacklistBtn);
+
+      // 签到黑名单按钮（绿=参与签到，灰=跳过签到）
+      const isSkipped = Utils.isCheckinSkipped(host);
+      const checkinNotSupported = siteData.checkinSupported === false;
+      const skipCheckinBtn = document.createElement("div");
+      skipCheckinBtn.className = "ldoh-btn";
+      skipCheckinBtn.title = checkinNotSupported
+        ? "LDOH 标记该站点不支持签到，如有变更请刷新页面同步"
+        : isSkipped
+          ? "已跳过签到（点击恢复）"
+          : "参与签到（点击跳过）";
+      skipCheckinBtn.style.color =
+        checkinNotSupported || isSkipped ? "#9ca3af" : "var(--ldoh-success)";
+      if (checkinNotSupported) skipCheckinBtn.style.cursor = "default";
+      skipCheckinBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>${checkinNotSupported ? `<line x1="7" y1="13" x2="17" y2="21"/><line x1="17" y1="13" x2="7" y2="21"/>` : `<polyline points="9 16 11 18 15 14"/>`}</svg>`;
+      if (!checkinNotSupported) {
+        skipCheckinBtn.onclick = (e) => {
+          e.stopPropagation();
+          const confirmText = isSkipped
+            ? `恢复 ${host} 自动签到？`
+            : `跳过 ${host} 自动签到？`;
+          this._showConfirmPopover(skipCheckinBtn, confirmText, () => {
+            const added = Utils.toggleCheckinSkip(host);
+            Utils.toast.success(
+              added ? `${host} 已跳过自动签到` : `${host} 已恢复自动签到`,
+            );
+            FloatingPanel.refresh();
+          });
+        };
+      }
+      row.appendChild(skipCheckinBtn);
+
+      // 删除按钮
+      const deleteBtn = document.createElement("div");
+      deleteBtn.className = "ldoh-btn";
+      deleteBtn.title = "删除缓存数据";
+      deleteBtn.style.color = "var(--ldoh-danger)";
+      deleteBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
+      deleteBtn.onmouseenter = () =>
+        (deleteBtn.style.background = "rgba(239, 68, 68, 0.1)");
+      deleteBtn.onmouseleave = () =>
+        (deleteBtn.style.background = "transparent");
+      deleteBtn.onclick = (e) => {
+        e.stopPropagation();
+        this._showConfirmPopover(deleteBtn, "确认删除？", () => {
+          const all = GM_getValue(CONFIG.STORAGE_KEY, {});
+          delete all[Utils.normalizeHost(host)];
+          GM_setValue(CONFIG.STORAGE_KEY, all);
+          const card = findCardByHost(host);
+          if (card) {
+            const container = card.querySelector(
+              `.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`,
+            );
+            if (container) container.remove();
+          }
+          FloatingPanel.refresh();
+          Utils.toast.success(`已删除 ${host} 的缓存数据`);
+        });
+      };
+      row.appendChild(deleteBtn);
+
+      return row;
     },
   };
 
@@ -2971,7 +3136,7 @@
 
       Log.debug(`[LDOH] 发现 ${cards.length} 个新卡片`);
 
-      cards.forEach(async (card) => {
+      cards.forEach((card) => {
         try {
           const links = Array.from(card.querySelectorAll("a"));
           const siteLink =
@@ -2992,28 +3157,11 @@
           }
 
           const normalizedHost = Utils.normalizeHost(host);
-          let data = Utils.getSiteData(normalizedHost);
-
-          // 从 DOM 提取站点名称并更新（每次都更新，修正可能的缓存错误）
-          const siteName = extractSiteName(card, null);
-          if (siteName && siteName !== data.siteName) {
-            Utils.saveSiteData(normalizedHost, { siteName });
-            data = { ...data, siteName };
-          } else if (siteName) {
-            data = { ...data, siteName };
-          }
+          const data = Utils.getSiteData(normalizedHost);
 
           if (data.userId) {
             Log.debug(`[LDOH] 渲染卡片: ${host}`);
             renderHelper(card, host, data);
-
-            // 异步更新数据
-            const fresh = await API.updateSiteStatus(host, data.userId);
-            if (fresh.ts !== data.ts) {
-              Log.debug(`[LDOH] 更新卡片: ${host}`);
-              renderHelper(card, host, fresh);
-              FloatingPanel.refresh();
-            }
           } else {
             // 标记为已检查，避免重复打印日志
             if (!card.dataset.ldohChecked) {
@@ -3031,8 +3179,159 @@
   }
 
   // ==================== 初始化和清理 ====================
+
+  /**
+   * 处理 /api/sites 响应：更新 WHITELIST_KEY（host 字符串数组）和 STORAGE_KEY（同步 siteName/checkinSupported）
+   * @param {Array} sites - LDOH API 返回的站点列表
+   */
+  function _processSitesResponse(sites) {
+    const entries = [];
+    sites.forEach((site) => {
+      try {
+        const host = Utils.normalizeHost(new URL(site.apiBaseUrl).hostname);
+        if (!host) return;
+        entries.push({
+          host,
+          name: site.name || host,
+          supportsCheckin: site.supportsCheckin === true,
+        });
+      } catch (_) {}
+    });
+
+    if (!entries.length) return;
+
+    GM_setValue(
+      CONFIG.WHITELIST_KEY,
+      entries.map((e) => e.host),
+    );
+
+    // 将 siteName / checkinSupported 同步到 STORAGE_KEY（仅在有变化时写入）
+    const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
+    let changed = false;
+    entries.forEach(({ host, name, supportsCheckin }) => {
+      const cur = allData[host] || {};
+      if (cur.siteName !== name || cur.checkinSupported !== supportsCheckin) {
+        allData[host] = {
+          ...cur,
+          siteName: name,
+          checkinSupported: supportsCheckin,
+        };
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      GM_setValue(CONFIG.STORAGE_KEY, allData);
+      debouncedRunPortalMode?.();
+      FloatingPanel.refresh();
+    }
+
+    Log.debug(`[站点监控] 站点列表已同步: ${entries.length} 个`);
+  }
+
+  /**
+   * 在 LDOH 门户 hook fetch（SWR）和 XHR，拦截 GET /api/sites 响应。
+   * 排除带 ?mode=runaway 的请求（LDOH 内部特殊模式）。
+   * 每次 LDOH SWR 刷新站点列表时，自动同步白名单与站点数据。
+   */
+  function hookLDOHSites() {
+    try {
+      // —— hook fetch（Next.js / SWR 默认走 fetch）——
+      const _origFetch = unsafeWindow.fetch;
+      unsafeWindow.fetch = new Proxy(_origFetch, {
+        apply(target, thisArg, args) {
+          const [input, init] = args;
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof Request
+                ? input.url
+                : String(input);
+          const method = (init?.method ?? "GET").toUpperCase();
+          const result = Reflect.apply(target, thisArg, args);
+          if (
+            method === "GET" &&
+            url.includes("/api/sites") &&
+            !url.includes("mode=runaway")
+          ) {
+            result
+              .then(async (res) => {
+                try {
+                  const data = await res.clone().json();
+                  if (Array.isArray(data.sites))
+                    _processSitesResponse(data.sites);
+                } catch (_) {}
+              })
+              .catch(() => {});
+          }
+          return result;
+        },
+      });
+
+      Log.debug("[站点监控] /api/sites hook 已启动（fetch）");
+    } catch (e) {
+      Log.warn("[站点监控] hookLDOHSites 失败", e);
+    }
+  }
+
+  /**
+   * 在公益站页面 hook XHR，监控用户手动签到，成功后即时更新 GM storage。
+   * 使用 unsafeWindow 访问页面真实的 XHR（绕过脚本沙箱）。
+   * 数据写入后会触发 LDOH 门户的 GM_addValueChangeListener，badge 自动更新。
+   */
+  function hookCheckinXHR() {
+    try {
+      const XHR = unsafeWindow.XMLHttpRequest;
+      // 防止重复 hook
+      if (XHR.prototype.__ldoh_hooked) return;
+      XHR.prototype.__ldoh_hooked = true;
+
+      const _open = XHR.prototype.open;
+      const _send = XHR.prototype.send;
+
+      XHR.prototype.open = function (method, url, ...rest) {
+        this._ldoh_method = method;
+        this._ldoh_url = url;
+        return _open.apply(this, [method, url, ...rest]);
+      };
+
+      XHR.prototype.send = function (body) {
+        if (
+          this._ldoh_method?.toUpperCase() === "POST" &&
+          typeof this._ldoh_url === "string" &&
+          this._ldoh_url.includes("/api/user/checkin")
+        ) {
+          this.addEventListener("load", function () {
+            try {
+              const res = JSON.parse(this.responseText);
+              if (res.success) {
+                const host = Utils.normalizeHost(window.location.hostname);
+                const siteData = Utils.getSiteData(host);
+                siteData.checkedInToday = true;
+                siteData.lastCheckinDate = getTodayString();
+                if (res.data?.quota_awarded) {
+                  siteData.quota =
+                    (siteData.quota || 0) + res.data.quota_awarded;
+                }
+                Utils.saveSiteData(host, siteData);
+                Log.success(`[签到监控] ${host} - 签到成功，已同步本地数据`);
+              }
+            } catch (e) {
+              Log.debug("[签到监控] 解析响应失败", e);
+            }
+          });
+        }
+        return _send.apply(this, arguments);
+      };
+
+      Log.debug("[签到监控] XHR hook 已启动");
+    } catch (e) {
+      Log.warn("[签到监控] XHR hook 失败（unsafeWindow 不可用？）", e);
+    }
+  }
   let observerInstance = null;
-  let debounceTimer = null;
+  let storageListenerId = null;
+  let debouncedRunPortalMode; // 提升至模块作用域，供 _processSitesResponse 调用
 
   /**
    * 初始化脚本
@@ -3040,7 +3339,7 @@
   async function init() {
     try {
       const host = window.location.hostname;
-      const isPortal = host === "ldoh.105117.xyz";
+      const isPortal = host === CONFIG.PORTAL_HOST;
 
       Log.info(`初始化开始 | 主机: ${host}`);
 
@@ -3048,34 +3347,14 @@
         // LDOH：监听 DOM 变化并渲染卡片
         Log.info("环境: LDOH");
 
-        // 等待卡片加载完成后更新白名单（只执行一次）
-        const initWhitelist = async () => {
-          // 等待卡片加载（最多等待 5 秒）
-          let attempts = 0;
-          const maxAttempts = 10;
-          while (attempts < maxAttempts) {
-            const cards = document.querySelectorAll(CONFIG.DOM.CARD_SELECTOR);
-            if (cards.length > 0) {
-              Log.debug(`[LDOH] 检测到 ${cards.length} 个卡片，更新白名单`);
-              Utils.updateSiteWhitelist();
-              break;
-            }
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            attempts++;
-          }
-          if (attempts >= maxAttempts) {
-            Log.warn("[LDOH] 等待卡片加载超时，使用现有白名单");
-          }
-        };
-
-        // 异步初始化白名单
-        initWhitelist();
+        // Hook LDOH /api/sites 自动维护白名单
+        hookLDOHSites();
 
         // 立即运行一次
         runPortalMode();
 
         // 使用防抖的 runPortalMode
-        const debouncedRunPortalMode = Utils.debounce(
+        debouncedRunPortalMode = Utils.debounce(
           runPortalMode,
           CONFIG.DEBOUNCE_DELAY,
         );
@@ -3092,8 +3371,28 @@
         Log.debug("[LDOH] MutationObserver 已启动");
         FloatingPanel.init();
 
-        // 自动定时刷新：每分钟检测一次是否有站点缓存已过期
-        setInterval(() => {
+        // 监听其他标签页（New API 站点）写入 STORAGE_KEY 的变化
+        // remote=true 表示变更来自另一个脚本实例（跨标签），此时重扫卡片并更新 badge
+        try {
+          storageListenerId = GM_addValueChangeListener(
+            CONFIG.STORAGE_KEY,
+            (_name, _oldVal, _newVal, remote) => {
+              if (remote) {
+                Log.debug("[LDOH] 检测到跨标签存储变更，重新扫描卡片");
+                debouncedRunPortalMode();
+                FloatingPanel.refresh();
+              }
+            },
+          );
+        } catch (e) {
+          Log.warn(
+            "[LDOH] GM_addValueChangeListener 不可用，新站点需刷新页面后显示",
+            e,
+          );
+        }
+
+        // 刷新过期缓存：检查所有站点，更新缓存已过期的条目
+        function refreshStaleData() {
           const settings = GM_getValue(CONFIG.SETTINGS_KEY, {});
           const intervalMs =
             (settings.interval || CONFIG.DEFAULT_INTERVAL) * 60 * 1000;
@@ -3115,24 +3414,30 @@
                 .catch((e) => Log.error(`[自动刷新] ${h}`, e));
             }
           });
-        }, 60_000);
+        }
+
+        // 页面加载时立即检查一次，随后每分钟定期检查
+        refreshStaleData();
+        setInterval(refreshStaleData, 60_000);
       } else {
         // 公益站：检测是否为 New API 站点
         Log.info("环境: 公益站");
 
         const isNewApi = await Utils.isNewApiSite();
         if (!isNewApi) {
-          Log.info(`${host} 不在 LDOH 白名单中或者不是 New API 站点，脚本退出`);
           return;
         }
 
         Log.success(`${host} 识别为 New API 站点`);
 
+        // 监控用户手动签到，成功后即时同步数据到 GM storage
+        hookCheckinXHR();
+
         // 检测登录状态
         let userId = Utils.getUserIdFromStorage();
 
         if (userId) {
-          // 已登录：立即更新数据
+          // 已登录：立即更新数据，无需注册长期监听
           Log.success(`识别到登录 UID: ${userId}，正在记录站点数据...`);
           API.updateSiteStatus(window.location.host, userId, true).catch(
             (e) => {
@@ -3140,30 +3445,29 @@
             },
           );
         } else {
-          // 未登录：等待登录或监听登录
+          // 未登录：先等待 OAuth 登录
           Log.debug("未检测到登录状态，开始监听...");
-
-          // 先尝试等待登录（OAuth 场景）
           userId = await Utils.waitForLogin();
           if (userId) {
+            // OAuth 登录成功，无需再注册长期监听
             Log.success(`OAuth 登录成功，用户 ID: ${userId}`);
             API.updateSiteStatus(window.location.host, userId, true).catch(
               (e) => {
                 Log.error("更新站点状态失败", e);
               },
             );
+          } else {
+            // 等待超时：注册长期监听（手动登录、Token 登录等场景）
+            Utils.watchLoginStatus((newUserId) => {
+              Log.success(`检测到登录，用户 ID: ${newUserId}`);
+              Utils.toast.success("检测到登录，正在获取站点数据...");
+              API.updateSiteStatus(window.location.host, newUserId, true).catch(
+                (e) => {
+                  Log.error("更新站点状态失败", e);
+                },
+              );
+            });
           }
-
-          // 持续监听登录状态变化
-          Utils.watchLoginStatus((newUserId) => {
-            Log.success(`检测到登录，用户 ID: ${newUserId}`);
-            Utils.toast.success("检测到登录，正在获取站点数据...");
-            API.updateSiteStatus(window.location.host, newUserId, true).catch(
-              (e) => {
-                Log.error("更新站点状态失败", e);
-              },
-            );
-          });
         }
       }
 
@@ -3186,9 +3490,14 @@
         Log.debug("MutationObserver 已断开");
       }
 
-      if (debounceTimer) {
-        clearTimeout(debounceTimer);
-        debounceTimer = null;
+      if (storageListenerId !== null) {
+        try {
+          GM_removeValueChangeListener(storageListenerId);
+          storageListenerId = null;
+          Log.debug("storageListenerId 已注销");
+        } catch (e) {
+          Log.warn("GM_removeValueChangeListener 调用失败", e);
+        }
       }
 
       Log.debug("清理完成");
@@ -3262,21 +3571,12 @@
   // 2. renderHelper 函数中判断签到状态时比较日期
 
   /**
-   * 获取今天的日期字符串
-   * @returns {string} 格式: "YYYY-MM-DD"
-   */
-  function getTodayDateString() {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  }
-
-  /**
    * 自动签到所有未签到站点
    * @param {boolean} showConfirm - 是否显示确认对话框（菜单命令传 true，面板按钮传 false）
    */
   async function runAutoCheckin(showConfirm = true) {
     const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-    const today = getTodayDateString();
+    const today = getTodayString();
     const sites = Object.entries(allData).filter(([host, data]) => {
       if (!data.userId || !data.token || !data.checkinSupported) return false;
       if (Utils.isCheckinSkipped(host)) return false;
