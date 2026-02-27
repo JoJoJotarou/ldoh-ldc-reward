@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.20
+// @version      1.0.21
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,11 @@
 
 /**
  * 版本更新日志
+ * v1.0.21 (2026-02-27)
+ * - feat：XHR 监听 /api/user/topup，兑换码成功后自动拉取余额并更新存储
+ * - fix：updateSiteStatus 中 /api/user/self 失败时不再覆盖余额为 null/0，保留旧值
+ * - feat：模型弹窗改为 3 列，展示按量/按次计费价格；弹窗加宽至 720px，字体增大
+ *
  * v1.0.20 (2026-02-27)
  * - feat：悬浮面板搜索栏下方新增签到状态筛选 chip（全部/已签到/未签到/不支持/无法检测签到），关闭面板不重置
  * - fix：panel body 加 min-height，筛选切换时面板高度不再抖动
@@ -255,10 +260,10 @@
     @keyframes ldoh-fade-in-blur { from { opacity: 0; backdrop-filter: blur(0); } to { opacity: 1; backdrop-filter: blur(6px); } }
 
     .ldh-dialog {
-      background: #fff; width: min(520px, 94vw); max-height: 85vh;
+      background: #fff; width: min(720px, 94vw); max-height: 85vh;
       border-radius: 20px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
       display: flex; flex-direction: column; overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.2); font-size: 13px;
       transform-origin: center; animation: ldoh-zoom-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
     }
     @keyframes ldoh-zoom-in { from { transform: scale(0.9) translateY(20px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
@@ -281,9 +286,10 @@
     .ldh-sec-badge { font-size: 11px; padding: 2px 8px; background: #f1f5f9; border-radius: 20px; color: var(--ldoh-text-light); }
 
     .ldh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+    .ldh-grid-models { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .ldh-item {
       padding: 12px; border: 1px solid var(--ldoh-border); border-radius: var(--ldoh-radius);
-      font-size: 12px; color: var(--ldoh-text); background: #fff; cursor: pointer;
+      font-size: 13px; color: var(--ldoh-text); background: #fff; cursor: pointer;
       position: relative; transition: all 0.2s ease;
       display: flex; flex-direction: column; gap: 4px;
     }
@@ -1169,8 +1175,8 @@
           }
         }
 
-        // 更新数据
-        data.quota = quota;
+        // 更新数据（quota 为 null 表示请求失败，保留旧值避免余额被清零）
+        if (quota != null) data.quota = quota;
         data.checkedInToday = checkedInToday;
         data.checkinSupported = checkinSupported;
         data.lastCheckinDate = lastCheckinDate;
@@ -1960,8 +1966,9 @@
       content.appendChild(modelsSecHeader);
 
       const modelsGrid = document.createElement("div");
-      modelsGrid.className = "ldh-grid";
+      modelsGrid.className = "ldh-grid-models";
       if (modelArray.length) {
+        const fmtPrice = (v) => parseFloat(v.toFixed(6)).toString();
         modelArray.forEach((m) => {
           const modelName = m.model_name || m;
           const item = document.createElement("div");
@@ -1969,8 +1976,23 @@
           item.dataset.copy = modelName;
           item.dataset.modelName = modelName;
           item.dataset.modelGroups = JSON.stringify(m.enable_groups || []);
+
+          let priceHtml = "";
+          if (typeof m.quota_type === "number") {
+            if (m.quota_type === 1) {
+              // 按次计费，直接显示 model_price
+              priceHtml = `<div style="font-size:10px;font-weight:600;color:#64748b">$${fmtPrice(m.model_price)} /次</div>`;
+            } else {
+              // 按量计费
+              const inPrice = m.model_ratio * 2;
+              const outPrice = m.model_ratio * (m.completion_ratio || 1) * 2;
+              priceHtml = `<div style="font-size:10px;font-weight:600;color:#64748b">输入: $${fmtPrice(inPrice)}/M · 输出: $${fmtPrice(outPrice)}/M</div>`;
+            }
+          }
+
           item.innerHTML = `
-            <div style="font-weight:600">${Utils.escapeHtml(modelName)}</div>
+            <div style="font-weight:600;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${Utils.escapeHtml(modelName)}</div>
+            ${priceHtml}
             <div style="font-size:9px;color:var(--ldoh-text-light)">点击复制</div>
           `;
           item.onclick = () => {
@@ -3353,6 +3375,37 @@
               }
             } catch (e) {
               Log.debug("[签到监控] 解析响应失败", e);
+            }
+          });
+        }
+
+        // 兑换码监听：topup 成功后重新拉取余额
+        if (
+          this._ldoh_method?.toUpperCase() === "POST" &&
+          typeof this._ldoh_url === "string" &&
+          this._ldoh_url.includes("/api/user/topup")
+        ) {
+          this.addEventListener("load", function () {
+            try {
+              const res = JSON.parse(this.responseText);
+              if (res.success && res.data > 0) {
+                const host = Utils.normalizeHost(window.location.hostname);
+                const siteData = Utils.getSiteData(host);
+                if (!siteData.token || !siteData.userId) return;
+                Log.info(`[兑换码] ${host} - 兑换成功，正在更新余额...`);
+                API.request("GET", host, "/api/user/self", siteData.token, siteData.userId)
+                  .then((selfRes) => {
+                    if (selfRes.success && selfRes.data?.quota != null) {
+                      siteData.quota = selfRes.data.quota / CONFIG.QUOTA_CONVERSION_RATE;
+                      Utils.saveSiteData(host, siteData);
+                      FloatingPanel.refresh();
+                      Log.success(`[兑换码] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`);
+                    }
+                  })
+                  .catch((e) => Log.error(`[兑换码] ${host} - 余额更新失败`, e));
+              }
+            } catch (e) {
+              Log.debug("[兑换码] 解析响应失败", e);
             }
           });
         }
