@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.21
+// @version      1.0.22
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,9 @@
 
 /**
  * 版本更新日志
+ * v1.0.22 (2026-02-27)
+ * - fix：topup/up.x666.me 签到监听存储 quota 改为原始单位，修复余额显示 $0.00 的问题
+ *
  * v1.0.21 (2026-02-27)
  * - feat：XHR 监听 /api/user/topup，兑换码成功后自动拉取余额并更新存储
  * - fix：updateSiteStatus 中 /api/user/self 失败时不再覆盖余额为 null/0，保留旧值
@@ -3360,17 +3363,17 @@
             try {
               const res = JSON.parse(this.responseText);
               if (res.success) {
+                Log.info(`[签到监控] ${host} - 签到成功，正在更新余额...`);
                 const host = "x666.me"; // up.x666.me 是 x666.me 的外站签到入口
                 const siteData = Utils.getSiteData(host);
                 siteData.checkedInToday = true;
                 siteData.lastCheckinDate = getTodayString();
                 if (typeof res.new_balance === "number") {
-                  siteData.quota =
-                    res.new_balance / CONFIG.QUOTA_CONVERSION_RATE;
+                  siteData.quota = res.new_balance;
                 }
                 Utils.saveSiteData(host, siteData);
                 Log.success(
-                  `[签到监控] ${host} - 签到成功（up.x666.me），已同步本地数据`,
+                  `[签到监控] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`,
                 );
               }
             } catch (e) {
@@ -3393,16 +3396,26 @@
                 const siteData = Utils.getSiteData(host);
                 if (!siteData.token || !siteData.userId) return;
                 Log.info(`[兑换码] ${host} - 兑换成功，正在更新余额...`);
-                API.request("GET", host, "/api/user/self", siteData.token, siteData.userId)
+                API.request(
+                  "GET",
+                  host,
+                  "/api/user/self",
+                  siteData.token,
+                  siteData.userId,
+                )
                   .then((selfRes) => {
                     if (selfRes.success && selfRes.data?.quota != null) {
-                      siteData.quota = selfRes.data.quota / CONFIG.QUOTA_CONVERSION_RATE;
+                      siteData.quota = selfRes.data.quota;
                       Utils.saveSiteData(host, siteData);
                       FloatingPanel.refresh();
-                      Log.success(`[兑换码] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`);
+                      Log.success(
+                        `[兑换码] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`,
+                      );
                     }
                   })
-                  .catch((e) => Log.error(`[兑换码] ${host} - 余额更新失败`, e));
+                  .catch((e) =>
+                    Log.error(`[兑换码] ${host} - 余额更新失败`, e),
+                  );
               }
             } catch (e) {
               Log.debug("[兑换码] 解析响应失败", e);
