@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.18
+// @version      1.0.19
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,7 +20,10 @@
 
 /**
  * 版本更新日志
- * v1.0.18 (2026-02-26)
+ * v1.0.19 (2026-02-27)
+ * - feat：监听 up.x666.me /api/checkin/spin，手动签到成功后即时同步 x666.me 数据
+ *
+ * v1.0.18 (2026-02-27)
  * - fix：normalizeHost 不再去除 www. 前缀，避免 www 站点 key 错误
  * - fix：自动签到成功后同步更新页面卡片签到状态
  * - fix：悬浮面板与卡片签到状态逻辑对齐，API 失败时均不显示状态
@@ -126,7 +129,7 @@
       "ai.qaq.al", // 非 New API 站点
     ],
     DEFAULT_CHECKIN_SKIP: new Map([
-      ["justdoitme.me", "CF Turnstile 拦截"],
+      //   ["justdoitme.me", "CF Turnstile 拦截"],
       ["api.67.si", "CF Turnstile 拦截"],
       ["runanytime.hxi.me", "CF Turnstile 拦截"],
       ["anyrouter.top", "登录自动签到"],
@@ -595,9 +598,7 @@
         Log.warn("normalizeHost 收到无效的 host", host);
         return "";
       }
-      return host
-        .toLowerCase()
-        .split(":")[0];
+      return host.toLowerCase().split(":")[0];
     },
 
     /**
@@ -792,12 +793,6 @@
     async isNewApiSite(retryCount = 5) {
       try {
         const host = window.location.hostname;
-
-        // LDOH 站点直接返回 true
-        if (host === CONFIG.PORTAL_HOST) {
-          return true;
-        }
-
         const normalizedHost = this.normalizeHost(host);
 
         // 第一步：检查是否在黑名单中（优先级最高）
@@ -3288,6 +3283,34 @@
             }
           });
         }
+
+        // 薄荷公益站（up.x666.me）签到监控
+        if (
+          this._ldoh_method?.toUpperCase() === "POST" &&
+          typeof this._ldoh_url === "string" &&
+          this._ldoh_url.includes("/api/checkin/spin") &&
+          window.location.hostname === "up.x666.me"
+        ) {
+          this.addEventListener("load", function () {
+            try {
+              const res = JSON.parse(this.responseText);
+              if (res.success) {
+                const host = "x666.me"; // up.x666.me 是 x666.me 的外站签到入口
+                const siteData = Utils.getSiteData(host);
+                siteData.checkedInToday = true;
+                siteData.lastCheckinDate = getTodayString();
+                if (typeof res.new_balance === "number") {
+                  siteData.quota = res.new_balance / CONFIG.QUOTA_CONVERSION_RATE;
+                }
+                Utils.saveSiteData(host, siteData);
+                Log.success(`[签到监控] ${host} - 签到成功（up.x666.me），已同步本地数据`);
+              }
+            } catch (e) {
+              Log.debug("[签到监控] 解析响应失败", e);
+            }
+          });
+        }
+
         return _send.apply(this, arguments);
       };
 
@@ -3389,6 +3412,13 @@
       } else {
         // 公益站：检测是否为 New API 站点
         Log.info("环境: 公益站");
+
+        // 特殊签到站：直接注入 hook，无需 New API 站点检测
+        if (host === "up.x666.me") {
+          Log.info("环境: 薄荷公益站签到站（up.x666.me）");
+          hookCheckinXHR();
+          return;
+        }
 
         const isNewApi = await Utils.isNewApiSite();
         if (!isNewApi) {
