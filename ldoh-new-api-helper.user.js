@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.19
+// @version      1.0.20
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,8 +20,12 @@
 
 /**
  * 版本更新日志
+ * v1.0.20 (2026-02-27)
+ * - feat：悬浮面板搜索栏下方新增签到状态筛选 chip（全部/已签到/未签到/不支持/无法检测签到），关闭面板不重置
+ * - fix：panel body 加 min-height，筛选切换时面板高度不再抖动
+ *
  * v1.0.19 (2026-02-27)
- * - feat：监听 up.x666.me /api/checkin/spin，手动签到成功后即时同步 x666.me 数据
+ * - feat：监听 up.x666.me /api/checkin/spin，手动签到成功后即时同步 x666.me 数据 （up.x666.me 签到站绕过白名单检测直接注入 XHR hook）
  *
  * v1.0.18 (2026-02-27)
  * - fix：normalizeHost 不再去除 www. 前缀，避免 www 站点 key 错误
@@ -351,7 +355,7 @@
     }
     .ldoh-panel-hd-total { font-size: 11px; color: var(--ldoh-text-light); }
     .ldoh-panel-search {
-      padding: 7px 12px; border-bottom: 1px solid var(--ldoh-border); flex-shrink: 0; background: #fff;
+      padding: 7px 12px 6px; border-bottom: 1px solid var(--ldoh-border); flex-shrink: 0; background: #fff;
     }
     .ldoh-panel-search-wrap { position: relative; }
     .ldoh-panel-search-icon {
@@ -364,7 +368,15 @@
       outline: none; background: #f8fafc; transition: border-color 0.2s, background 0.2s;
     }
     .ldoh-panel-search-input:focus { border-color: var(--ldoh-primary); background: #fff; }
-    .ldoh-panel-body { overflow-y: auto; flex: 1; scrollbar-width: thin; }
+    .ldoh-filter-bar { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+    .ldoh-filter-chip {
+      font-size: 10px; padding: 2px 8px; border-radius: 10px; cursor: pointer;
+      border: 1px solid var(--ldoh-border); background: #f8fafc; color: var(--ldoh-text-light);
+      user-select: none; transition: all 0.15s; white-space: nowrap;
+    }
+    .ldoh-filter-chip:hover { border-color: #cbd5e1; color: var(--ldoh-text); }
+    .ldoh-filter-chip.active { background: var(--ldoh-primary); color: #fff; border-color: var(--ldoh-primary); }
+    .ldoh-panel-body { overflow-y: auto; flex: 1; scrollbar-width: thin; min-height: 200px; }
     .ldoh-panel-row {
       display: grid; grid-template-columns: 1fr 54px 64px 22px 22px 22px 22px 22px 22px;
       align-items: center; gap: 6px; padding: 7px 12px;
@@ -2109,6 +2121,7 @@
     _panel: null,
     _isOpen: false,
     _searchQuery: "",
+    _checkinFilter: "",
     _checkinRunning: false,
     _refreshAllRunning: false,
     _confirmPop: null,
@@ -2827,25 +2840,54 @@
           <svg class="ldoh-panel-search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input class="ldoh-panel-search-input" placeholder="搜索站点名称/地址..." value="${Utils.escapeHtml(this._searchQuery)}">
         </div>
+        <div class="ldoh-filter-bar">
+          <span class="ldoh-filter-chip${this._checkinFilter === "" ? " active" : ""}" data-filter="">全部</span>
+          <span class="ldoh-filter-chip${this._checkinFilter === "ok" ? " active" : ""}" data-filter="ok">已签到</span>
+          <span class="ldoh-filter-chip${this._checkinFilter === "no" ? " active" : ""}" data-filter="no">未签到</span>
+          <span class="ldoh-filter-chip${this._checkinFilter === "na" ? " active" : ""}" data-filter="na">不支持/无法检测签到</span>
+        </div>
       `;
 
       const bindSearch = (body) => {
         const searchInput = searchBar.querySelector(".ldoh-panel-search-input");
+        const chips = searchBar.querySelectorAll(".ldoh-filter-chip");
+
+        const updateVisibility = () => {
+          body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
+            const matchSearch =
+              !this._searchQuery ||
+              row.dataset.searchKey.includes(this._searchQuery);
+            const matchFilter =
+              !this._checkinFilter ||
+              row.dataset.checkinStatus === this._checkinFilter;
+            row.style.display = matchSearch && matchFilter ? "" : "none";
+          });
+        };
+
         let timer = null;
         searchInput.oninput = () => {
           clearTimeout(timer);
           timer = setTimeout(() => {
             this._searchQuery = searchInput.value.toLowerCase().trim();
-            body.querySelectorAll(".ldoh-panel-row").forEach((row) => {
-              row.style.display =
-                !this._searchQuery ||
-                row.dataset.searchKey.includes(this._searchQuery)
-                  ? ""
-                  : "none";
-            });
+            updateVisibility();
           }, 200);
         };
+
+        chips.forEach((chip) => {
+          chip.onclick = () => {
+            this._checkinFilter = chip.dataset.filter;
+            chips.forEach((c) =>
+              c.classList.toggle(
+                "active",
+                c.dataset.filter === this._checkinFilter,
+              ),
+            );
+            updateVisibility();
+          };
+        });
+
         if (this._searchQuery) searchInput.focus();
+        updateVisibility();
       };
 
       return { searchBar, bindSearch };
@@ -2893,6 +2935,7 @@
 
       const displayName = siteData.siteName || host;
       row.dataset.searchKey = `${displayName} ${host}`.toLowerCase();
+      row.dataset.checkinStatus = checkinClass;
       if (
         this._searchQuery &&
         !row.dataset.searchKey.includes(this._searchQuery)
@@ -3300,10 +3343,13 @@
                 siteData.checkedInToday = true;
                 siteData.lastCheckinDate = getTodayString();
                 if (typeof res.new_balance === "number") {
-                  siteData.quota = res.new_balance / CONFIG.QUOTA_CONVERSION_RATE;
+                  siteData.quota =
+                    res.new_balance / CONFIG.QUOTA_CONVERSION_RATE;
                 }
                 Utils.saveSiteData(host, siteData);
-                Log.success(`[签到监控] ${host} - 签到成功（up.x666.me），已同步本地数据`);
+                Log.success(
+                  `[签到监控] ${host} - 签到成功（up.x666.me），已同步本地数据`,
+                );
               }
             } catch (e) {
               Log.debug("[签到监控] 解析响应失败", e);
