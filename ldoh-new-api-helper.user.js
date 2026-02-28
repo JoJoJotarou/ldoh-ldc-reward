@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.24
+// @version      1.0.25
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,12 @@
 
 /**
  * 版本更新日志
+ * v1.0.25 (2026-02-28)
+ * - refactor：token 刷新逻辑移出 updateSiteStatus，仅在公益站点初始化时通过 API.fetchToken() 获取一次
+ * - feat：token 获取失败时自动用 document.cookie 中的 session 字段重试
+ * - refactor：新增 API.fetchToken / API.fetchSelf / API.fetchKeys，消除所有外部 API.request() 直接调用
+ * - fix：updateSiteStatus / refreshStaleData / runRefreshAll 均加 token 存在性守卫，避免无凭证发起请求
+ *
  * v1.0.24 (2026-02-28)
  * - feat：黑名单语义调整为"XHR 被动监控"：注入 hookCheckinXHR + hookSelfXHR + hookTopupXHR，跳过主动 API 调用
  * - feat：新增独立函数 hookSelfXHR()、hookTopupXHR()，与 hookCheckinXHR() 并列；topup 黑名单分支直接累加充入量，非黑名单分支调 API 拉取准确余额
@@ -162,7 +168,6 @@
     QUOTA_CONVERSION_RATE: 500000, // New API 额度转美元固定汇率
     PORTAL_HOST: "ldoh.105117.xyz",
     REQUEST_TIMEOUT: 10000, // 请求超时时间（毫秒）
-    TOKEN_TTL_MS: 12 * 60 * 60 * 1000, // Token 缓存有效期（12 小时）
     DEBOUNCE_DELAY: 800, // 防抖延迟（毫秒）
     LOGIN_CHECK_INTERVAL: 500, // 登录检测间隔（毫秒）
     LOGIN_CHECK_MAX_ATTEMPTS: 10, // 登录检测最大尝试次数（5秒）
@@ -994,6 +999,7 @@
       userId = null,
       body = null,
       isInteractive = false,
+      extraHeaders = {},
     ) {
       await this._acquire(isInteractive);
       Log.debug(
@@ -1012,6 +1018,7 @@
               Referer: `https://${host}/`,
               ...(token ? { Authorization: `Bearer ${token}` } : {}),
               ...(userId ? { "New-Api-User": userId } : {}),
+              ...extraHeaders,
             },
             timeout: CONFIG.REQUEST_TIMEOUT,
             onload: (res) => {
@@ -1090,29 +1097,9 @@
 
         Log.info(`[开始更新] ${host} (用户: ${userId}, 强制: ${force})`);
 
-        // 获取 token（首次或超过 12 小时重新获取）
-        const tokenExpired =
-          data.token &&
-          (!data.tokenTs || Date.now() - data.tokenTs >= CONFIG.TOKEN_TTL_MS);
-        if (!data.token || tokenExpired) {
-          if (tokenExpired) Log.debug(`[Token 过期] ${host} - 重新获取`);
-          else Log.debug(`[获取 Token] ${host}`);
-          const tokenRes = await this.request(
-            "GET",
-            host,
-            "/api/user/token",
-            null,
-            userId,
-          );
-          Log.debug(`[Token 响应] ${host}`, tokenRes);
-          if (tokenRes.success && tokenRes.data) {
-            data.token = tokenRes.data;
-            data.tokenTs = Date.now();
-            Log.success(`[Token 获取成功] ${host}`);
-          } else {
-            Log.error(`[Token 获取失败] ${host}`, tokenRes);
-            return data;
-          }
+        if (!data.token) {
+          Log.warn(`[跳过更新] ${host} - token 不存在，请访问站点以初始化`);
+          return data;
         }
 
         // 第一步：从 /api/user/self 获取余额
@@ -1215,25 +1202,12 @@
     async fetchDetails(host, token, userId) {
       try {
         Log.debug(`[获取详情] ${host}`);
-        const [pricingRes, tokenRes] = await Promise.all([
+        const [pricingRes, keys] = await Promise.all([
           this.request("GET", host, "/api/pricing", token, userId, null, true),
-          this.request(
-            "GET",
-            host,
-            "/api/token/?p=0&size=1000",
-            token,
-            userId,
-            null,
-            true,
-          ),
+          this.fetchKeys(host, token, userId),
         ]);
 
         const models = pricingRes.success ? pricingRes.data : [];
-        const keys = tokenRes.success
-          ? Array.isArray(tokenRes.data)
-            ? tokenRes.data
-            : tokenRes.data?.items || []
-          : [];
 
         Log.debug(
           `[详情获取完成] ${host} - 模型: ${Array.isArray(models) ? models.length : 0}, 密钥: ${Array.isArray(keys) ? keys.length : 0}`,
@@ -1278,6 +1252,88 @@
       } catch (e) {
         Log.error(`[获取分组列表异常] ${host}`, e);
         return {};
+      }
+    },
+
+    /**
+     * 获取 token（首次；失败时自动用 session cookie 重试）
+     * @param {string} host - 规范化主机名
+     * @param {string} userId - 用户 ID
+     * @returns {Promise<string|null>} token 字符串，失败返回 null
+     */
+    async fetchToken(host, userId) {
+      try {
+        let res = await this.request("GET", host, "/api/user/token", null, userId);
+        if (!res.success || !res.data) {
+          const sessionVal = document.cookie
+            .split(";")
+            .map((c) => c.trim())
+            .find((c) => c.startsWith("session="))
+            ?.slice("session=".length);
+          if (sessionVal) {
+            Log.debug(`[Token] ${host} - 首次获取失败，尝试 session cookie 重试`);
+            res = await this.request(
+              "GET",
+              host,
+              "/api/user/token",
+              null,
+              userId,
+              null,
+              false,
+              { Cookie: `session=${sessionVal}` },
+            );
+          }
+        }
+        if (res.success && res.data) {
+          Log.success(`[Token] ${host} - 获取成功`);
+          return res.data;
+        }
+        Log.error(`[Token] ${host} - 获取失败`, res);
+        return null;
+      } catch (e) {
+        Log.error(`[Token] ${host} - 异常`, e);
+        return null;
+      }
+    },
+
+    /**
+     * 获取用户余额（GET /api/user/self）
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @returns {Promise<object>} 响应对象
+     */
+    async fetchSelf(host, token, userId) {
+      return this.request("GET", host, "/api/user/self", token, userId);
+    },
+
+    /**
+     * 获取密钥列表（GET /api/token/）
+     * @param {string} host - 主机名
+     * @param {string} token - 认证令牌
+     * @param {string} userId - 用户 ID
+     * @param {number} page - 页码（默认 0）
+     * @returns {Promise<Array>} 密钥数组
+     */
+    async fetchKeys(host, token, userId, page = 0) {
+      try {
+        const res = await this.request(
+          "GET",
+          host,
+          `/api/token/?p=${page}&size=1000`,
+          token,
+          userId,
+          null,
+          true,
+        );
+        return res.success
+          ? Array.isArray(res.data)
+            ? res.data
+            : res.data?.items || []
+          : [];
+      } catch (e) {
+        Log.error(`[fetchKeys] ${host}`, e);
+        return [];
       }
     },
 
@@ -1911,20 +1967,7 @@
 
       // 创建成功后就地刷新密钥列表，无需关/开弹窗
       const onCreated = async () => {
-        const tokenRes = await API.request(
-          "GET",
-          host,
-          "/api/token/?p=1&size=1000",
-          data.token,
-          data.userId,
-          null,
-          true,
-        );
-        const newKeys = tokenRes.success
-          ? Array.isArray(tokenRes.data)
-            ? tokenRes.data
-            : tokenRes.data?.items || []
-          : [];
+        const newKeys = await API.fetchKeys(host, data.token, data.userId, 1);
         keysGrid.innerHTML = "";
         if (newKeys.length) {
           newKeys.forEach((k) =>
@@ -3500,13 +3543,7 @@
                 } else {
                   if (!siteData.token || !siteData.userId) return;
                   Log.info(`[兑换码] ${host} - 兑换成功，正在更新余额...`);
-                  API.request(
-                    "GET",
-                    host,
-                    "/api/user/self",
-                    siteData.token,
-                    siteData.userId,
-                  )
+                  API.fetchSelf(host, siteData.token, siteData.userId)
                     .then((selfRes) => {
                       if (selfRes.success && selfRes.data?.quota != null) {
                         siteData.quota = selfRes.data.quota;
@@ -3608,6 +3645,7 @@
           Object.entries(allData).forEach(([h, d]) => {
             if (
               d.userId &&
+              d.token &&
               !Utils.isBlacklisted(h) &&
               d.ts &&
               now - d.ts >= intervalMs
@@ -3657,14 +3695,29 @@
         // 检测登录状态
         let userId = Utils.getUserIdFromStorage();
 
+        // 在公益站点首次获取 token，后续 updateSiteStatus 直接使用存储值
+        async function initSiteStatus(uid) {
+          const normalizedHost = Utils.normalizeHost(host);
+          const siteData = Utils.getSiteData(normalizedHost);
+          if (!siteData.token) {
+            Log.debug(`[Token] ${host} - 首次获取`);
+            const token = await API.fetchToken(normalizedHost, uid);
+            if (token) {
+              siteData.token = token;
+              Utils.saveSiteData(normalizedHost, siteData);
+            } else {
+              Log.error(`[Token] ${host} - 获取失败`);
+            }
+          }
+          return API.updateSiteStatus(host, uid, true);
+        }
+
         if (userId) {
           // 已登录：立即更新数据，无需注册长期监听
           Log.success(`识别到登录 UID: ${userId}，正在记录站点数据...`);
-          API.updateSiteStatus(window.location.host, userId, true).catch(
-            (e) => {
-              Log.error("更新站点状态失败", e);
-            },
-          );
+          initSiteStatus(userId).catch((e) => {
+            Log.error("更新站点状态失败", e);
+          });
         } else {
           // 未登录：先等待 OAuth 登录
           Log.debug("未检测到登录状态，开始监听...");
@@ -3672,21 +3725,17 @@
           if (userId) {
             // OAuth 登录成功，无需再注册长期监听
             Log.success(`OAuth 登录成功，用户 ID: ${userId}`);
-            API.updateSiteStatus(window.location.host, userId, true).catch(
-              (e) => {
-                Log.error("更新站点状态失败", e);
-              },
-            );
+            initSiteStatus(userId).catch((e) => {
+              Log.error("更新站点状态失败", e);
+            });
           } else {
             // 等待超时：注册长期监听（手动登录、Token 登录等场景）
             Utils.watchLoginStatus((newUserId) => {
               Log.success(`检测到登录，用户 ID: ${newUserId}`);
               Utils.toast.success("检测到登录，正在获取站点数据...");
-              API.updateSiteStatus(window.location.host, newUserId, true).catch(
-                (e) => {
-                  Log.error("更新站点状态失败", e);
-                },
-              );
+              initSiteStatus(newUserId).catch((e) => {
+                Log.error("更新站点状态失败", e);
+              });
             });
           }
         }
@@ -3741,9 +3790,9 @@
   async function runRefreshAll() {
     const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
 
-    // 只刷新有 userId 且不在黑名单中的站点
+    // 只刷新有 userId + token 且不在黑名单中的站点
     const sites = Object.entries(allData).filter(
-      ([host, data]) => data.userId && !Utils.isBlacklisted(host),
+      ([host, data]) => data.userId && data.token && !Utils.isBlacklisted(host),
     );
     const siteCount = sites.length;
 
