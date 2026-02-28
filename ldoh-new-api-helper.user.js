@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.23
+// @version      1.0.24
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,12 @@
 
 /**
  * 版本更新日志
+ * v1.0.24 (2026-02-28)
+ * - feat：黑名单语义调整为"XHR 被动监控"：注入 hookCheckinXHR + hookSelfXHR + hookTopupXHR，跳过主动 API 调用
+ * - feat：新增独立函数 hookSelfXHR()、hookTopupXHR()，与 hookCheckinXHR() 并列；topup 黑名单分支直接累加充入量，非黑名单分支调 API 拉取准确余额
+ * - feat：黑名单站点现可在面板中显示（过滤条件改为 d.userId || d.quota != null），按钮精简（密钥/刷新隐藏，签到跳过置灰保留）
+ * - fix：黑名单行签到/余额列与普通行对齐（空占位替代密钥/刷新）
+ *
  * v1.0.23 (2026-02-28)
  * - fix：up.x666.me XHR hook 中 const host 先于声明被引用（暂时性死区），导致监听静默失败
  *
@@ -819,13 +825,7 @@
         const host = window.location.hostname;
         const normalizedHost = this.normalizeHost(host);
 
-        // 第一步：检查是否在黑名单中（优先级最高）
-        if (Utils.isBlacklisted(normalizedHost)) {
-          Log.debug(`[站点识别] ${host} - 在黑名单中，跳过`);
-          return false;
-        }
-
-        // 第二步：检查是否在 LDOH 站点白名单中
+        // 第一步：检查是否在 LDOH 站点白名单中
         const whitelist = GM_getValue(CONFIG.WHITELIST_KEY, []);
         const inWhitelist = whitelist.includes(normalizedHost);
 
@@ -2261,7 +2261,9 @@
 
     _updateBadge() {
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
-      const count = Object.values(allData).filter((d) => d.userId).length;
+      const count = Object.values(allData).filter(
+        (d) => d.userId || d.quota != null,
+      ).length;
       const badge = document.getElementById("ldoh-fab-badge");
       if (badge) {
         badge.textContent = count;
@@ -2752,7 +2754,7 @@
 
       const allData = GM_getValue(CONFIG.STORAGE_KEY, {});
       const sorted = Object.entries(allData)
-        .filter(([, d]) => d.userId)
+        .filter(([, d]) => d.userId || d.quota != null)
         .sort(([, a], [, b]) => (b.quota || 0) - (a.quota || 0));
       const totalBalance = sorted.reduce(
         (sum, [, d]) => sum + (d.quota || 0),
@@ -2944,6 +2946,7 @@
     _buildSiteRow(host, siteData) {
       const row = document.createElement("div");
       row.className = "ldoh-panel-row";
+      const isBlacklisted = Utils.isBlacklisted(host);
 
       // 签到状态
       let checkinClass = "na",
@@ -3053,17 +3056,22 @@
         }
       };
 
-      row.appendChild(keyBtn);
-      row.appendChild(refreshBtn);
+      // 密钥、刷新：黑名单时用空占位保持列对齐
+      if (isBlacklisted) {
+        row.appendChild(document.createElement("div"));
+        row.appendChild(document.createElement("div"));
+      } else {
+        row.appendChild(keyBtn);
+        row.appendChild(refreshBtn);
+      }
       row.appendChild(locateBtn);
 
-      // 检测黑名单按钮（绿=检测中，灰=已屏蔽）
-      const isBlacklisted = Utils.isBlacklisted(host);
+      // 检测黑名单按钮（绿=检测中，灰=被动监控）
       const blacklistBtn = document.createElement("div");
       blacklistBtn.className = "ldoh-btn";
       blacklistBtn.title = isBlacklisted
-        ? "已屏蔽（点击恢复检测）"
-        : "检测中（点击加入黑名单）";
+        ? "被动监控（点击恢复主动检测）"
+        : "主动检测（点击切换为被动监控）";
       blacklistBtn.style.color = isBlacklisted
         ? "#9ca3af"
         : "var(--ldoh-success)";
@@ -3071,8 +3079,8 @@
       blacklistBtn.onclick = (e) => {
         e.stopPropagation();
         const confirmText = isBlacklisted
-          ? `移出黑名单并恢复检测？`
-          : `加入黑名单并停止检测？`;
+          ? `移出黑名单并恢复主动 API 检测？`
+          : `加入黑名单（仅保留 XHR 被动监控）？`;
         this._showConfirmPopover(blacklistBtn, confirmText, () => {
           const added = Utils.toggleBlacklist(host);
           Utils.toast.success(
@@ -3113,6 +3121,13 @@
             FloatingPanel.refresh();
           });
         };
+      }
+      // 签到跳过：黑名单时置灰禁用，始终显示
+      if (isBlacklisted) {
+        skipCheckinBtn.title = "黑名单站点不参与自动签到";
+        skipCheckinBtn.style.color = "#9ca3af";
+        skipCheckinBtn.style.cursor = "default";
+        skipCheckinBtn.onclick = null;
       }
       row.appendChild(skipCheckinBtn);
 
@@ -3385,47 +3400,6 @@
           });
         }
 
-        // 兑换码监听：topup 成功后重新拉取余额
-        if (
-          this._ldoh_method?.toUpperCase() === "POST" &&
-          typeof this._ldoh_url === "string" &&
-          this._ldoh_url.includes("/api/user/topup")
-        ) {
-          this.addEventListener("load", function () {
-            try {
-              const res = JSON.parse(this.responseText);
-              if (res.success && res.data > 0) {
-                const host = Utils.normalizeHost(window.location.hostname);
-                const siteData = Utils.getSiteData(host);
-                if (!siteData.token || !siteData.userId) return;
-                Log.info(`[兑换码] ${host} - 兑换成功，正在更新余额...`);
-                API.request(
-                  "GET",
-                  host,
-                  "/api/user/self",
-                  siteData.token,
-                  siteData.userId,
-                )
-                  .then((selfRes) => {
-                    if (selfRes.success && selfRes.data?.quota != null) {
-                      siteData.quota = selfRes.data.quota;
-                      Utils.saveSiteData(host, siteData);
-                      FloatingPanel.refresh();
-                      Log.success(
-                        `[兑换码] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`,
-                      );
-                    }
-                  })
-                  .catch((e) =>
-                    Log.error(`[兑换码] ${host} - 余额更新失败`, e),
-                  );
-              }
-            } catch (e) {
-              Log.debug("[兑换码] 解析响应失败", e);
-            }
-          });
-        }
-
         return _send.apply(this, arguments);
       };
 
@@ -3434,6 +3408,134 @@
       Log.warn("[签到监控] XHR hook 失败（unsafeWindow 不可用？）", e);
     }
   }
+
+  /**
+   * hook XHR，监听 GET /api/user/self，被动同步余额（黑名单站点也适用）
+   */
+  function hookSelfXHR() {
+    try {
+      const XHR = unsafeWindow.XMLHttpRequest;
+      if (XHR.prototype.__ldoh_self_hooked) return;
+      XHR.prototype.__ldoh_self_hooked = true;
+
+      const _open = XHR.prototype.open;
+      XHR.prototype.open = function (method, url, ...rest) {
+        this._ldoh_self_method = method;
+        this._ldoh_self_url = url;
+        return _open.apply(this, [method, url, ...rest]);
+      };
+
+      const _send = XHR.prototype.send;
+      XHR.prototype.send = function (body) {
+        if (
+          this._ldoh_self_method?.toUpperCase() === "GET" &&
+          typeof this._ldoh_self_url === "string" &&
+          this._ldoh_self_url.includes("/api/user/self")
+        ) {
+          this.addEventListener("load", function () {
+            try {
+              const res = JSON.parse(this.responseText);
+              if (res.success && res.data?.quota != null) {
+                const host = Utils.normalizeHost(window.location.hostname);
+                const siteData = Utils.getSiteData(host);
+                siteData.quota = res.data.quota;
+                Utils.saveSiteData(host, siteData);
+                FloatingPanel.refresh();
+                Log.success(
+                  `[余额监控] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`,
+                );
+              }
+            } catch (e) {
+              Log.debug("[余额监控] 解析响应失败", e);
+            }
+          });
+        }
+        return _send.apply(this, arguments);
+      };
+
+      Log.debug("[余额监控] XHR hook 已启动");
+    } catch (e) {
+      Log.warn("[余额监控] hookSelfXHR 失败", e);
+    }
+  }
+
+  /**
+   * hook XHR，监听 POST /api/user/topup，兑换码成功后更新余额。
+   * 黑名单站点直接累加充入量；非黑名单站点调 API 拉取准确余额。
+   */
+  function hookTopupXHR() {
+    try {
+      const XHR = unsafeWindow.XMLHttpRequest;
+      if (XHR.prototype.__ldoh_topup_hooked) return;
+      XHR.prototype.__ldoh_topup_hooked = true;
+
+      const _open = XHR.prototype.open;
+      XHR.prototype.open = function (method, url, ...rest) {
+        this._ldoh_topup_method = method;
+        this._ldoh_topup_url = url;
+        return _open.apply(this, [method, url, ...rest]);
+      };
+
+      const _send = XHR.prototype.send;
+      XHR.prototype.send = function (body) {
+        if (
+          this._ldoh_topup_method?.toUpperCase() === "POST" &&
+          typeof this._ldoh_topup_url === "string" &&
+          this._ldoh_topup_url.includes("/api/user/topup")
+        ) {
+          this.addEventListener("load", function () {
+            try {
+              const res = JSON.parse(this.responseText);
+              if (res.success && res.data > 0) {
+                const host = Utils.normalizeHost(window.location.hostname);
+                const siteData = Utils.getSiteData(host);
+                if (Utils.isBlacklisted(host)) {
+                  // 黑名单：无法调 API，直接累加充入量
+                  siteData.quota = (siteData.quota || 0) + res.data;
+                  Utils.saveSiteData(host, siteData);
+                  FloatingPanel.refresh();
+                  Log.success(
+                    `[兑换码] ${host} - 余额已更新（累加）: $${Utils.formatQuota(siteData.quota)}`,
+                  );
+                } else {
+                  if (!siteData.token || !siteData.userId) return;
+                  Log.info(`[兑换码] ${host} - 兑换成功，正在更新余额...`);
+                  API.request(
+                    "GET",
+                    host,
+                    "/api/user/self",
+                    siteData.token,
+                    siteData.userId,
+                  )
+                    .then((selfRes) => {
+                      if (selfRes.success && selfRes.data?.quota != null) {
+                        siteData.quota = selfRes.data.quota;
+                        Utils.saveSiteData(host, siteData);
+                        FloatingPanel.refresh();
+                        Log.success(
+                          `[兑换码] ${host} - 余额已更新: $${Utils.formatQuota(siteData.quota)}`,
+                        );
+                      }
+                    })
+                    .catch((e) =>
+                      Log.error(`[兑换码] ${host} - 余额更新失败`, e),
+                    );
+                }
+              }
+            } catch (e) {
+              Log.debug("[兑换码] 解析响应失败", e);
+            }
+          });
+        }
+        return _send.apply(this, arguments);
+      };
+
+      Log.debug("[兑换码] XHR hook 已启动");
+    } catch (e) {
+      Log.warn("[兑换码] hookTopupXHR 失败", e);
+    }
+  }
+
   let observerInstance = null;
   let storageListenerId = null;
   let debouncedRunPortalMode; // 提升至模块作用域，供 _processSitesResponse 调用
@@ -3528,7 +3630,7 @@
         // 公益站：检测是否为 New API 站点
         Log.info("环境: 公益站");
 
-        // 特殊签到站：直接注入 hook，无需 New API 站点检测
+        // 特殊签到站：仅注入签到 hook
         if (host === "up.x666.me") {
           Log.info("环境: 薄荷公益站签到站（up.x666.me）");
           hookCheckinXHR();
@@ -3540,10 +3642,17 @@
           return;
         }
 
-        Log.success(`${host} 识别为 New API 站点`);
-
-        // 监控用户手动签到，成功后即时同步数据到 GM storage
+        // 是 New API 站点，无条件注入 XHR 被动监控
         hookCheckinXHR();
+        hookSelfXHR();
+        hookTopupXHR();
+
+        if (Utils.isBlacklisted(Utils.normalizeHost(host))) {
+          Log.info(
+            `${host} 在黑名单中，已注入 XHR 被动监控，跳过主动 API 调用`,
+          );
+          return;
+        }
 
         // 检测登录状态
         let userId = Utils.getUserIdFromStorage();
