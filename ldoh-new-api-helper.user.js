@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LDOH New API Helper
 // @namespace    jojojotarou.ldoh.newapi.helper
-// @version      1.0.22
+// @version      1.0.23
 // @description  LDOH New API 助手（余额查询、自动签到、密钥管理、模型查询）
 // @author       @JoJoJotarou
 // @match        https://ldoh.105117.xyz/*
@@ -20,6 +20,9 @@
 
 /**
  * 版本更新日志
+ * v1.0.23 (2026-02-28)
+ * - fix：up.x666.me XHR hook 中 const host 先于声明被引用（暂时性死区），导致监听静默失败
+ *
  * v1.0.22 (2026-02-27)
  * - fix：topup/up.x666.me 签到监听存储 quota 改为原始单位，修复余额显示 $0.00 的问题
  *
