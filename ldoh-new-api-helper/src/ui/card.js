@@ -77,9 +77,14 @@ export const CardView = {
 
       try {
         const host = normalizeHost(new URL(siteLink.href).hostname);
+        const container = this.ensureHostAnchor(card, host);
         const siteData = getSiteData(host);
         if (siteData.userId || siteData.quota != null) {
           this.render(card, host, siteData);
+        } else if (container) {
+          // 无数据时仅保留锚点用于定位，不展示辅助 UI
+          container.innerHTML = "";
+          container.style.display = "none";
         }
       } catch (_e) {
         // ignore
@@ -96,7 +101,10 @@ export const CardView = {
       `.${CONFIG.DOM.HELPER_CONTAINER_CLASS}[data-host="${target}"]`,
     );
     if (containers.length === 0) return false;
-    containers.forEach((container) => this.renderContent(container, host, data));
+    containers.forEach((container) => {
+      container.style.display = "";
+      this.renderContent(container, host, data);
+    });
     return true;
   },
 
@@ -116,6 +124,15 @@ export const CardView = {
    * 渲染/挂载卡片助手 UI
    */
   render(card, host, data) {
+    const container = this.ensureHostAnchor(card, host);
+    container.style.display = "";
+    this.renderContent(container, host, data);
+  },
+
+  /**
+   * 确保卡片存在可定位锚点，并写入 data-host
+   */
+  ensureHostAnchor(card, host) {
     const targetHost = normalizeHost(host);
     let container = card.querySelector(`.${CONFIG.DOM.HELPER_CONTAINER_CLASS}`);
 
@@ -156,7 +173,8 @@ export const CardView = {
       }
     }
 
-    this.renderContent(container, host, data);
+    container.dataset.host = targetHost;
+    return container;
   },
 
   /**
