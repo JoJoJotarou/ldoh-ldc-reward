@@ -619,7 +619,7 @@ export const FloatingPanel = {
       innerHTML: UI.ICONS.REFRESH,
       onClick: (e) => {
         e.stopPropagation();
-        if (this._refreshAllRunning) return;
+        if (this._refreshAllRunning || refreshAllBtn.classList.contains("loading")) return;
         this._showConfirmPopover(refreshAllBtn, "确认刷新全部？", async () => {
           this._refreshAllRunning = true;
           refreshAllBtn.classList.add("loading");
@@ -639,7 +639,7 @@ export const FloatingPanel = {
       innerHTML: UI.ICONS.CHECKIN,
       onClick: (e) => {
         e.stopPropagation();
-        if (this._checkinRunning) return;
+        if (this._checkinRunning || checkinBtn.classList.contains("loading")) return;
         this._showConfirmPopover(checkinBtn, "确认自动签到？", async () => {
           this._checkinRunning = true;
           checkinBtn.classList.add("loading");
@@ -761,10 +761,20 @@ export const FloatingPanel = {
     if (!isBlk) {
       row.appendChild(
         UI.div({
-          className: "ldoh-btn",
+          className: "ldoh-btn ldoh-details-btn",
           title: "密钥与模型详情",
           innerHTML: UI.ICONS.DETAILS,
-          onClick: () => showDetailsDialog(host, siteData),
+          onClick: async (e) => {
+            e.stopPropagation();
+            const btn = e.currentTarget;
+            if (btn.classList.contains("loading")) return;
+            btn.classList.add("loading");
+            try {
+              await showDetailsDialog(host, siteData);
+            } finally {
+              btn.classList.remove("loading");
+            }
+          },
         }),
       );
     } else {

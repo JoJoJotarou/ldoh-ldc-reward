@@ -28,14 +28,18 @@ export const SiteService = {
 
     const progressToast = Toast.show(`正在刷新站点 0/${siteCount}...`, "info", 0);
     let completedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
 
     const promises = sites.map(async ([host, data]) => {
       try {
         const fresh = await API.updateSiteStatus(host, data.userId, true);
         // 通过 EventBus 通知外部：数据已更新。让感兴趣的 UI 自行决定如何渲染。
         EventBus.emit(UI_EVENTS.DATA_CHANGED, { host, next: fresh, renderable: true });
+        successCount++;
       } catch (e) {
         Log.error(`[SiteRefresh] 刷新站点失败: ${host}`, e);
+        failedCount++;
       }
 
       completedCount++;
@@ -47,7 +51,11 @@ export const SiteService = {
 
     await Promise.all(promises);
     Toast.remove(progressToast);
-    Toast.success(`已刷新 ${siteCount} 个站点`, 3000);
+    if (failedCount > 0) {
+      Toast.warning(`刷新完成：成功 ${successCount} 个，失败 ${failedCount} 个`, 4000);
+    } else {
+      Toast.success(`刷新完成：成功 ${successCount} 个，失败 0 个`, 3000);
+    }
     // 通知面板或全局：整体刷新完成
     EventBus.emit(UI_EVENTS.GLOBAL_REFRESH);
   },
@@ -226,13 +234,14 @@ export const SiteService = {
    */
   async refreshSite(host, siteData, showToast = true) {
     try {
-      const fresh = await API.updateSiteStatus(host, siteData.userId, true);
+      const fresh = await API.updateSiteStatus(host, siteData.userId, true, true);
       EventBus.emit(UI_EVENTS.DATA_CHANGED, { host, next: fresh, renderable: true });
       if (showToast) Toast.success(`${host} 已更新`);
       return fresh;
     } catch (err) {
       Log.error(`[站点刷新] ${host}`, err);
-      if (showToast) Toast.error("刷新失败");
+      if (showToast)
+        Toast.error(String(err?.message || "").includes("请求超时") ? "刷新超时" : "刷新失败");
       throw err;
     }
   },

@@ -136,10 +136,10 @@ async function _probeQuota(host, token, userId) {
   const res = await request("GET", host, "/api/user/self", token, userId);
   if (res.success && res.data) {
     Log.debug(`[用户信息] ${host} - 额度: ${res.data.quota}`);
-    return res.data.quota;
+    return { success: true, quota: res.data.quota, error: null };
   }
   Log.error(`[用户信息获取失败] ${host}`, res);
-  return null;
+  return { success: false, quota: null, error: res?.error || "请求失败" };
 }
 
 /** 探测站点签到状态 */
@@ -150,9 +150,13 @@ async function _probeCheckinStatus(host, token, userId, currentData) {
   if (currentData.checkinSupported === false) {
     Log.debug(`[签到数据] ${host} - LDOH 标记不支持签到，跳过探测`);
     return {
-      checkedInToday: null,
-      checkinSupported: false,
-      lastCheckinDate: currentData.lastCheckinDate,
+      success: true,
+      error: null,
+      data: {
+        checkedInToday: null,
+        checkinSupported: false,
+        lastCheckinDate: currentData.lastCheckinDate,
+      },
     };
   }
 
@@ -164,14 +168,22 @@ async function _probeCheckinStatus(host, token, userId, currentData) {
     if (host === "wzw.pp.ua") checkedInToday = !!res.data?.checked_in;
     const lastCheckinDate = checkedInToday ? todayStr : currentData.lastCheckinDate;
     Log.debug(`[签到数据] ${host} - 已签到: ${checkedInToday}`);
-    return { checkedInToday, checkinSupported: true, lastCheckinDate };
+    return {
+      success: true,
+      error: null,
+      data: { checkedInToday, checkinSupported: true, lastCheckinDate },
+    };
   }
 
   Log.warn(`[签到数据获取失败] ${host} - 接口请求失败`, res);
   return {
-    checkedInToday: null,
-    checkinSupported: currentData.checkinSupported ?? true,
-    lastCheckinDate: currentData.lastCheckinDate,
+    success: false,
+    error: res?.error || "请求失败",
+    data: {
+      checkedInToday: null,
+      checkinSupported: currentData.checkinSupported ?? true,
+      lastCheckinDate: currentData.lastCheckinDate,
+    },
   };
 }
 
@@ -180,42 +192,53 @@ async function _probeCheckinStatus(host, token, userId, currentData) {
 /**
  * 更新站点状态（余额 + 签到状态）
  */
-async function updateSiteStatus(host, userId, force = false) {
-  try {
-    let data = getSiteData(host);
-    const settings = GM_getValue(CONFIG.SETTINGS_KEY, { interval: CONFIG.DEFAULT_INTERVAL });
+async function updateSiteStatus(host, userId, force = false, strict = false) {
+  let data = getSiteData(host);
+  const settings = GM_getValue(CONFIG.SETTINGS_KEY, { interval: CONFIG.DEFAULT_INTERVAL });
 
-    if (!force && data.ts && Date.now() - data.ts < settings.interval * 60 * 1000) {
-      Log.debug(
-        `[跳过更新] ${host} - 距离上次更新 ${Math.round((Date.now() - data.ts) / 60000)} 分钟`,
-      );
-      return data;
-    }
-
-    Log.info(`[开始更新] ${host} (强制: ${force})`);
-    if (!data.token) {
-      Log.warn(`[跳过更新] ${host} - token 不存在`);
-      return data;
-    }
-
-    // 1. 获取余额
-    const quota = await _probeQuota(host, data.token, userId);
-    if (quota != null) data.quota = quota;
-
-    // 2. 获取签到状态
-    const checkin = await _probeCheckinStatus(host, data.token, userId, data);
-    Object.assign(data, checkin);
-
-    data.userId = userId;
-    saveSiteData(host, data);
-
-    const checkinLabel = data.checkinSupported ? (data.checkedInToday ? "是" : "否") : "不支持";
-    Log.success(`[更新完成] ${host} - 额度: $${formatQuota(data.quota)}, 签到: ${checkinLabel}`);
+  if (!force && data.ts && Date.now() - data.ts < settings.interval * 60 * 1000) {
+    Log.debug(
+      `[跳过更新] ${host} - 距离上次更新 ${Math.round((Date.now() - data.ts) / 60000)} 分钟`,
+    );
     return data;
-  } catch (e) {
-    Log.error(`[更新异常] ${host}`, e);
-    return getSiteData(host);
   }
+
+  Log.info(`[开始更新] ${host} (强制: ${force})`);
+  if (!data.token) {
+    Log.warn(`[跳过更新] ${host} - token 不存在`);
+    return data;
+  }
+
+  // 1. 获取余额
+  const quotaResult = await _probeQuota(host, data.token, userId);
+  if (!quotaResult.success) {
+    if (quotaResult.error === "请求超时") {
+      throw new Error(`${host} 请求超时`);
+    }
+    if (strict) {
+      throw new Error(`${host} 接口请求失败`);
+    }
+  }
+  if (quotaResult.success && quotaResult.quota != null) data.quota = quotaResult.quota;
+
+  // 2. 获取签到状态
+  const checkinResult = await _probeCheckinStatus(host, data.token, userId, data);
+  if (!checkinResult.success) {
+    if (checkinResult.error === "请求超时") {
+      throw new Error(`${host} 请求超时`);
+    }
+    if (strict) {
+      throw new Error(`${host} 接口请求失败`);
+    }
+  }
+  Object.assign(data, checkinResult.data);
+
+  data.userId = userId;
+  saveSiteData(host, data);
+
+  const checkinLabel = data.checkinSupported ? (data.checkedInToday ? "是" : "否") : "不支持";
+  Log.success(`[更新完成] ${host} - 额度: $${formatQuota(data.quota)}, 签到: ${checkinLabel}`);
+  return data;
 }
 
 /**

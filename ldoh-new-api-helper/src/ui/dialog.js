@@ -10,6 +10,8 @@ import { Toast } from "./toast.js";
 import { createOverlay } from "./overlay.js";
 import { UI } from "./base.js";
 
+const _detailLoadingHosts = new Set();
+
 /** 关闭详情对话框（带退出动画） */
 function _closeDetailDialog() {
   const ov = document.querySelector(".ldh-overlay");
@@ -355,8 +357,11 @@ function _buildKeyItem(k, host, data, keysGrid, modelItems, modelsBadge, modelAr
  * 显示详情对话框
  */
 export async function showDetailsDialog(host, data) {
+  if (_detailLoadingHosts.has(host)) return;
+  _detailLoadingHosts.add(host);
+  let loadingOverlay = null;
   try {
-    const loadingOverlay = createOverlay(
+    loadingOverlay = createOverlay(
       '<div class="ldh-header"><div class="ldh-title">正在获取密钥和模型...</div></div>' +
         '<div class="ldh-content" style="align-items:center;justify-content:center;min-height:200px">' +
         '<div class="ldoh-refresh-btn loading">' +
@@ -391,7 +396,10 @@ export async function showDetailsDialog(host, data) {
     const overlay = createOverlay("");
     overlay.querySelector(".ldh-dialog").replaceWith(dialog);
   } catch (e) {
+    if (loadingOverlay?.parentNode) loadingOverlay.remove();
     Log.error(`[详情失败] ${host}`, e);
     Toast.error("获取详情失败");
+  } finally {
+    _detailLoadingHosts.delete(host);
   }
 }

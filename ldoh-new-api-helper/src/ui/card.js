@@ -11,6 +11,7 @@ import { EventBus, UI_EVENTS } from "../utils/bus.js";
 import { debounce, injectStyles } from "../utils/misc.js";
 import { UI } from "./base.js";
 import { SiteService } from "../services/site.js";
+import { showDetailsDialog } from "./dialog.js";
 
 export const CardView = {
   _observer: null,
@@ -212,13 +213,20 @@ export const CardView = {
 
       container.appendChild(
         UI.div({
-          className: "ldoh-btn",
+          className: "ldoh-btn ldoh-details-btn",
           title: "详情",
           innerHTML: UI.ICONS.DETAILS,
-          onClick: (e) => {
+          onClick: async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            EventBus.emit(UI_EVENTS.SHOW_DETAILS, host, data);
+            const btn = e.currentTarget;
+            if (btn.classList.contains("loading")) return;
+            btn.classList.add("loading");
+            try {
+              await showDetailsDialog(host, data);
+            } finally {
+              btn.classList.remove("loading");
+            }
           },
         }),
       );
